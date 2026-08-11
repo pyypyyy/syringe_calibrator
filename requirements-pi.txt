@@ -1,0 +1,3 @@
+-r requirements.txt
+pigpio>=1.78
+adafruit-circuitpython-ads1x15>=2.2
