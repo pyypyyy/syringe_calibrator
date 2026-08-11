@@ -5,7 +5,10 @@ class SoftPotMapping:
     def __init__(self, points):
         self.points=sorted(points,key=lambda p:p["mean_voltage_v"]); volumes=[p["volume_ml"] for p in self.points]
         delta=np.diff(volumes)
+        voltages=np.asarray([p["mean_voltage_v"] for p in self.points],float)
         if len(points)<3 or not (np.all(delta>0) or np.all(delta<0)): raise ValueError("SoftPot mapping must contain at least three monotonic points")
+        if np.any(np.diff(voltages)<=1e-6): raise ValueError("SoftPot voltages must be distinct")
+        if np.ptp(voltages)<0.25: raise ValueError("SoftPot voltage span is inadequate")
     def volume(self, voltage):
         x=[p["mean_voltage_v"] for p in self.points]
         if not x[0]<=voltage<=x[-1]: raise PositionOutOfRange("SoftPot voltage outside calibrated range")

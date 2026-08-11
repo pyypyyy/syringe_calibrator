@@ -28,7 +28,21 @@ def create_app(config_path="config.yaml"):
     else: hardware["errors"].append("SoftPot calibration: no valid calibration")
     hardware["ready"]=not hardware["errors"]
     if hardware["ready"]: controller=__import__("calibration.controller",fromlist=["CalibrationController"]).CalibrationController(flow,read_position,stepper,store,config)
-    app=Flask(__name__,template_folder="web/templates",static_folder="web/static"); app.config.update(GASFLOW_CONFIG=config); app.register_blueprint(create_blueprint(store,controller,hardware,adc,config)); return app
+    runtime={"controller":controller}
+    def activate_softpot(data):
+        if not adc:
+            raise RuntimeError("ADS1115 unavailable")
+        new_filter=RobustPositionFilter(SoftPotMapping(data["points"]),config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
+        def active_reader():
+            voltage=adc.voltage(config["ads1115"]["softpot_channel"]); _,filtered=new_filter.update(voltage); return voltage,filtered
+        if runtime["controller"]:
+            runtime["controller"].install_position_reader(active_reader)
+        elif flow and stepper:
+            runtime["controller"]=__import__("calibration.controller",fromlist=["CalibrationController"]).CalibrationController(flow,active_reader,stepper,store,config)
+        hardware["softpot_calibrated"]=True
+        hardware["errors"]=[e for e in hardware["errors"] if not e.startswith("SoftPot calibration:")]
+        hardware["ready"]=not hardware["errors"]
+    app=Flask(__name__,template_folder="web/templates",static_folder="web/static"); app.config.update(GASFLOW_CONFIG=config); app.register_blueprint(create_blueprint(store,runtime,hardware,adc,config,activate_softpot)); return app
 
 if __name__=="__main__":
     logging.basicConfig(level=logging.INFO); app=create_app(); cfg=app.config["GASFLOW_CONFIG"]["server"]; app.run(host=cfg["host"],port=cfg["port"],debug=False,use_reloader=False)
