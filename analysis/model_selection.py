@@ -25,11 +25,23 @@ def compare_models(repeats, candidates=None):
             try: model=fit_model(name,*zip(*grouped),voltage_range=(lo,hi))
             except (ValueError,FloatingPointError,np.linalg.LinAlgError): continue
             for row in test: errors.append({"target_flow_lpm":held,"actual_lpm":row["reference_flow_lpm"],"error_lpm":float(model.predict(row["sensor_voltage_v"])-row["reference_flow_lpm"])})
-        try: final=fit_model(name,[r["sensor_voltage_v"] for r in repeats],[r["reference_flow_lpm"] for r in repeats],(lo,hi))
+        # Final fitting uses one unweighted calibration anchor per flow level,
+        # consistent with the CV training folds.
+        final_points=[]
+        for level in levels:
+            rows=[r for r in repeats if r["target_flow_lpm"]==level]
+            final_points.append((np.mean([r["sensor_voltage_v"] for r in rows]),np.mean([r["reference_flow_lpm"] for r in rows])))
+        try: final=fit_model(name,*zip(*final_points),(lo,hi))
         except (ValueError,FloatingPointError,np.linalg.LinAlgError) as exc: warnings.append(str(exc)); continue
         e=np.array([x["error_lpm"] for x in errors]);
         if not len(e): continue
-        scores.append(ModelScore(name,final.coefficients,degree+1,float(np.mean(abs(e))),float(np.sqrt(np.mean(e*e))),float(max(abs(e))),final.monotonic,errors,warnings+final.warnings))
+        grid=np.linspace(lo,hi,500); predicted=np.asarray(final.predict(grid)); physical=final.monotonic
+        if np.min(predicted) < -0.05:
+            warnings.append("curve predicts significantly negative flow inside calibrated range"); physical=False
+        measured_max=max(r["reference_flow_lpm"] for r in repeats)
+        if np.max(predicted) > max(2.0, measured_max*3):
+            warnings.append("curve has implausible edge predictions"); physical=False
+        scores.append(ModelScore(name,final.coefficients,degree+1,float(np.mean(abs(e))),float(np.sqrt(np.mean(e*e))),float(max(abs(e))),physical,errors,warnings+final.warnings))
     oe=[]
     for r in repeats: oe.append({"target_flow_lpm":r["target_flow_lpm"],"actual_lpm":r["reference_flow_lpm"],"error_lpm":float(omron_reference(r["sensor_voltage_v"])-r["reference_flow_lpm"])})
     e=np.array([x["error_lpm"] for x in oe]); scores.append(ModelScore("omron_reference",None,0,float(np.mean(abs(e))),float(np.sqrt(np.mean(e*e))),float(max(abs(e))),True,oe,[]))

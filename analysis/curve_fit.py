@@ -21,6 +21,7 @@ def fit_model(name, voltage, flow, voltage_range=None):
     mono=monotonic_over(coeff,vr)
     if not mono: warnings.append("curve decreases inside calibrated voltage range")
     if not np.all(np.isfinite(coeff)): warnings.append("non-finite coefficients")
+    if any(abs(value)>1e6 for value in coeff): warnings.append("extreme polynomial coefficients")
     return FittedModel(name,degree,coeff,mono,warnings)
 
 def predict_checked(model, voltage, valid_range):

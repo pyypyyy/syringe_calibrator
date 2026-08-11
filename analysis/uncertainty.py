@@ -15,4 +15,4 @@ def bootstrap_band(repeats, model_name, iterations=2000, grid_size=200, seed=Non
         curves.append(model.predict(grid))
     if not curves: raise ValueError("all bootstrap fits were invalid")
     values=np.asarray(curves)
-    return {"voltage_v":grid.tolist(),"lower_lpm":np.percentile(values,2.5,axis=0).tolist(),"upper_lpm":np.percentile(values,97.5,axis=0).tolist(),"accepted_iterations":len(curves),"rejected_iterations":rejected}
+    return {"voltage_v":grid.tolist(),"lower_lpm":np.percentile(values,2.5,axis=0).tolist(),"upper_lpm":np.percentile(values,97.5,axis=0).tolist(),"requested_iterations":iterations,"accepted_iterations":len(curves),"rejected_iterations":rejected,"rejection_fraction":rejected/iterations}
