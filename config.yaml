@@ -1,0 +1,19 @@
+server: {host: "0.0.0.0", port: 5000}
+ads1115: {address: 0x48, flow_channel: 1, softpot_channel: 2, gain: 1}
+stepper: {step_pin: 18, dir_pin: 4, enable_pin: 21, enable_active_low: true, invert_direction: false}
+axis: {syringe_volume_ml: 100.0, microsteps_per_ml: 208.0}
+calibration:
+  target_flows_lpm: [0.02, 0.05, 0.10, 0.25, 0.50, 0.75, 1.00]
+  repeats: 3
+  positioning_speed_lpm: 0.1
+  sample_interval_s: 0.05
+  settle_s: 2.0
+  zero_duration_s: 5.0
+  min_stroke_ml: 2.0
+  max_stroke_ml: 60.0
+  target_duration_s: 45.0
+  min_duration_s: 30.0
+  max_duration_s: 60.0
+analysis: {candidate_models: [linear, quadratic, cubic, polynomial_5], include_omron_reference: true, bootstrap_iterations: 2000}
+safety: {min_volume_ml: 0.0, max_volume_ml: 100.0, max_position_jump_ml: 5.0, jump_persistence: 3, stall_timeout_s: 2.0}
+data_dir: data

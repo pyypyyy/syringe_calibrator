@@ -1,0 +1,1 @@
+document.querySelector('#start')?.addEventListener('click',async()=>{const body={gas:gas.value,targets_lpm:targets.value.split(',').map(Number),repeats:+repeats.value};const r=await fetch('/api/calibration/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(r.ok)location='/calibration';else alert((await r.json()).error)});

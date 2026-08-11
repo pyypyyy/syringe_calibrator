@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>Calibration history</h1><table><tr><th>Date</th><th>Gas</th><th>Targets</th><th>Results</th></tr>{% for r in runs %}<tr><td>{{r.created_at}}</td><td>{{r.gas}}</td><td>{{r.targets_lpm}}</td><td><a href="/results/{{r.run_id}}">View</a></td></tr>{% endfor %}</table>{% endblock %}

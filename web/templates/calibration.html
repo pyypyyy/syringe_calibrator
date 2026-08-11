@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>Calibration progress</h1><progress id="progress" max="1"></progress><dl id="status"></dl><button id="stop">Stop calibration</button><button id="emergency" class="danger">Emergency stop</button>{% endblock %}{% block scripts %}<script src="{{url_for('static',filename='calibration.js')}}"></script>{% endblock %}
