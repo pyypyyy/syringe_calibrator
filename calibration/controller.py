@@ -15,6 +15,7 @@ from analysis.quality import (
 )
 from analysis.reference_flow import estimate_reference_flow
 from analysis.uncertainty import bootstrap_band
+from analysis.omron_reference import omron_reference
 from .calibration_plan import StrokePlan, select_stroke
 
 log = logging.getLogger(__name__)
@@ -142,9 +143,10 @@ class CalibrationController:
 
     def _position_bounds(self) -> tuple[float, float]:
         safety = self.config.get("safety", {})
-        calibrated = self.config.get("softpot", {})
-        low = max(float(safety.get("min_volume_ml", 0)), float(calibrated.get("min_volume_ml", -np.inf)))
-        high = min(float(safety.get("max_volume_ml", 100)), float(calibrated.get("max_volume_ml", np.inf)))
+        calibrated_low = getattr(self.position_reader, "min_calibrated_volume_ml", safety.get("min_volume_ml", 0))
+        calibrated_high = getattr(self.position_reader, "max_calibrated_volume_ml", safety.get("max_volume_ml", 100))
+        low = max(float(safety.get("min_volume_ml", 0)), float(calibrated_low))
+        high = min(float(safety.get("max_volume_ml", 100)), float(calibrated_high))
         if high <= low:
             raise MotionSafetyError("mechanical and calibrated SoftPot ranges do not overlap")
         return low, high
@@ -343,6 +345,14 @@ class CalibrationController:
         )
         voltages = [sample["flow_sensor_voltage_v"] for sample in stable]
         expected_sign = plan.direction
+        stable_fraction = max(0.0, 1.0 - start_fraction - end_fraction)
+        planned_duration = plan.expected_duration_s * stable_fraction
+        interval = float(self.config.get("calibration", {}).get("sample_interval_s", 0.05))
+        planned_samples = planned_duration / interval
+        quality = self.config.get("quality", {})
+        acceptable = float(quality.get("planned_data_acceptable_fraction", 0.75))
+        required_duration = min(float(quality.get("minimum_duration_s", 20.0)), planned_duration * acceptable)
+        required_samples = max(3, min(int(quality.get("minimum_samples", 100)), int(np.floor(planned_samples * acceptable))))
         summary = {
             "trial_id": f"flow_{target:.3f}_repeat_{repeat}",
             "target_flow_lpm": target,
@@ -359,6 +369,12 @@ class CalibrationController:
             "stable_region_end_s": stable[-1]["elapsed_s"],
             "stable_region_start_position_ml": stable[0]["filtered_volume_ml"],
             "stable_region_end_position_ml": stable[-1]["filtered_volume_ml"],
+            "planned_stable_duration_s": planned_duration,
+            "actual_stable_duration_s": float(stable[-1]["elapsed_s"] - stable[0]["elapsed_s"]),
+            "minimum_acceptable_duration_s": required_duration,
+            "planned_stable_sample_count": planned_samples,
+            "actual_stable_sample_count": len(stable),
+            "minimum_acceptable_sample_count": required_samples,
             **regression.to_dict(),
             "direction_valid": regression.slope_ml_s * expected_sign > 0,
             "expected_slope_sign": expected_sign,
@@ -366,7 +382,8 @@ class CalibrationController:
             "softpot_valid": True,
             "rejection_category": None,
         }
-        reasons = trial_rejection_reasons(summary, self.config.get("quality", {}))
+        reasons = trial_rejection_reasons(summary, {**quality, "minimum_samples": required_samples,
+                                                     "minimum_duration_s": required_duration})
         summary["accepted"] = not reasons
         summary["rejection_reasons"] = reasons
         if reasons:
@@ -423,6 +440,8 @@ class CalibrationController:
         accepted = [row for row in summaries if row["accepted"]]
         points = self._calibration_points(summaries, targets_info)
         usable = [point for point in points if point["target_quality"] == "GOOD"]
+        usable_targets = {point["target_flow_lpm"] for point in usable}
+        model_trials = [row for row in accepted if row["target_flow_lpm"] in usable_targets]
         failures, warnings = [], []
         if len(usable) < 3:
             failures.append("too few usable calibration flow levels")
@@ -452,7 +471,7 @@ class CalibrationController:
                 selected = select_empirical_model(scores)
                 selected_dict = selected.to_dict()
                 band = bootstrap_band(
-                    accepted,
+                    model_trials,
                     selected.name,
                     int(self.config.get("analysis", {}).get("bootstrap_iterations", 2000)),
                 )
@@ -461,6 +480,11 @@ class CalibrationController:
             except Exception as exc:
                 failures.append(f"analysis could not select a physically valid model: {exc}")
         status = "FAILED" if failures else "WARNING" if warnings else "GOOD"
+        relative_errors = ([abs(e["error_lpm"] / e["actual_lpm"] * 100)
+                            for e in selected_dict["errors"] if abs(e["actual_lpm"]) >= 1e-6]
+                           if selected_dict else [])
+        repeatability = [point["reference_flow_sd_lpm"] for point in usable]
+        omron_grid = band["voltage_v"] if band else []
         analysis = {
             "run_id": run_id,
             "gas": gas,
@@ -477,6 +501,11 @@ class CalibrationController:
             "rejected_trials": len(summaries) - len(accepted),
             "total_trials": len(summaries),
             "usable_calibration_points": len(usable),
+            "bootstrap_usable_target_flows_lpm": sorted(usable_targets),
+            "maximum_relative_error_percent": max(relative_errors, default=None),
+            "mean_reference_flow_repeatability_sd_lpm": float(np.mean(repeatability)) if repeatability else None,
+            "median_reference_flow_repeatability_sd_lpm": float(np.median(repeatability)) if repeatability else None,
+            "omron_reference_series": {"voltage_v": omron_grid, "flow_lpm": [float(omron_reference(v)) for v in omron_grid]},
             "target_diagnostics": targets_info,
             "calibration_points": points,
             "valid_voltage_range_v": [min((p["mean_sensor_voltage_v"] for p in usable), default=0), max((p["mean_sensor_voltage_v"] for p in usable), default=0)],
@@ -487,9 +516,11 @@ class CalibrationController:
         self.store.write_csv(run_id, "calibration_points.csv", points)
         self.store.write_csv(run_id, "trial_summary.csv", summaries)
         self.store.write_json(run_id, "analysis.json", analysis)
-        self.store.update_run(run_id, {"completion_state": "COMPLETE", "analysis_status": status})
+        completion = "FAILED" if status == "FAILED" else "COMPLETE"
+        self.store.update_run(run_id, {"completion_state": completion, "analysis_status": status,
+                                       "message": "; ".join(failures or warnings)})
         self._set(
-            state=State.COMPLETE,
+            state=State.FAILED if status == "FAILED" else State.COMPLETE,
             accepted=len(accepted),
             rejected=len(summaries) - len(accepted),
             message="; ".join(failures or warnings),

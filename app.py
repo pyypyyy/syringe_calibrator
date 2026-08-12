@@ -20,9 +20,10 @@ def create_app(config_path="config.yaml"):
     calibration=store.latest_softpot()
     if calibration and adc:
         try:
-            filt=RobustPositionFilter(SoftPotMapping(calibration["points"]),config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
+            mapping=SoftPotMapping(calibration["points"]); filt=RobustPositionFilter(mapping,config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
             def read_position():
                 voltage=adc.voltage(config["ads1115"]["softpot_channel"]); raw,filtered=filt.update(voltage); return voltage,filtered
+            read_position.min_calibrated_volume_ml=mapping.min_calibrated_volume_ml; read_position.max_calibrated_volume_ml=mapping.max_calibrated_volume_ml
             hardware["softpot_calibrated"]=True
         except Exception as exc: hardware["errors"].append(f"SoftPot calibration: {exc}")
     else: hardware["errors"].append("SoftPot calibration: no valid calibration")
@@ -32,9 +33,10 @@ def create_app(config_path="config.yaml"):
     def activate_softpot(data):
         if not adc:
             raise RuntimeError("ADS1115 unavailable")
-        new_filter=RobustPositionFilter(SoftPotMapping(data["points"]),config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
+        mapping=SoftPotMapping(data["points"]); new_filter=RobustPositionFilter(mapping,config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
         def active_reader():
             voltage=adc.voltage(config["ads1115"]["softpot_channel"]); _,filtered=new_filter.update(voltage); return voltage,filtered
+        active_reader.min_calibrated_volume_ml=mapping.min_calibrated_volume_ml; active_reader.max_calibrated_volume_ml=mapping.max_calibrated_volume_ml
         if runtime["controller"]:
             runtime["controller"].install_position_reader(active_reader)
         elif flow and stepper:

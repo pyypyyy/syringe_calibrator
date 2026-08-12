@@ -11,6 +11,8 @@ class SoftPotCalibrationSession:
     def save(self,path):
         validation={"errors":[],"warnings":[]}
         if len(self.points)<3: validation["errors"].append("at least three calibration positions are required")
+        captured={float(p["volume_ml"]) for p in self.points}
+        if not {0.0,25.0,50.0,75.0,100.0}.issubset(captured): validation["warnings"].append(f"Incomplete standard calibration; movement is restricted to {min(captured,default=0):g}–{max(captured,default=0):g} ml.")
         voltages=[p["mean_voltage_v"] for p in self.points]
         if voltages and np.ptp(voltages)<0.25: validation["errors"].append("SoftPot voltage span is inadequate")
         if len(set(round(v,6) for v in voltages)) != len(voltages): validation["errors"].append("duplicate or degenerate voltages")
@@ -18,5 +20,5 @@ class SoftPotCalibrationSession:
         try: SoftPotMapping(self.points)
         except ValueError as exc: validation["errors"].append(str(exc))
         if validation["errors"]: raise ValueError("; ".join(validation["errors"]))
-        payload={"created_at":datetime.now(timezone.utc).isoformat(),"valid":True,"validation":validation,"points":self.points}
+        payload={"created_at":datetime.now(timezone.utc).isoformat(),"valid":True,"validation":validation,"points":self.points,"min_calibrated_volume_ml":min(p["volume_ml"] for p in self.points),"max_calibrated_volume_ml":max(p["volume_ml"] for p in self.points)}
         path.write_text(json.dumps(payload,indent=2)); return payload
