@@ -76,3 +76,16 @@ def test_failed_analysis_has_failed_controller_and_durable_artifacts(tmp_path):
     assert c.store.read_json(run_id,'run.json')['completion_state']=='FAILED'
     assert c.store.read_json(run_id,'analysis.json')['status']=='FAILED'
     assert (c.store.path(run_id)/'calibration_points.csv').exists()
+
+def test_target_repeat_outliers_use_unit_specific_tolerances(tmp_path):
+    c = controller(tmp_path)
+    def rows(volts, flows):
+        return [{"target_flow_lpm": .5, "sensor_voltage_v": v,
+                 "reference_flow_lpm": f, "accepted": True,
+                 "rejection_reasons": []} for v, f in zip(volts, flows)]
+    near = rows([1, 1, 1.000001], [.5, .5, .500001])
+    assert c.evaluate_target_repeats(near, .5, 3)["accepted_repeats"] == 3
+    voltage_bad = rows([1, 1, 1.3], [.5, .5, .5])
+    assert c.evaluate_target_repeats(voltage_bad, .5, 3)["accepted_repeats"] == 2
+    flow_bad = rows([1, 1, 1], [.5, .5, .8])
+    assert c.evaluate_target_repeats(flow_bad, .5, 3)["accepted_repeats"] == 2

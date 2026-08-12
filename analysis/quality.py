@@ -1,16 +1,24 @@
 import numpy as np
 
 
-def robust_repeat_outliers(values, threshold=3.5):
-    """Return a median/MAD modified-z-score outlier mask."""
+def robust_repeat_outliers(values, threshold=3.5, zero_mad_absolute_tolerance=0.002):
+    """Return a median/MAD modified-z-score outlier mask.
+
+    With a zero MAD (common for three repeats), differences within the supplied
+    physical tolerance are treated as equivalent instead of comparing them to
+    floating-point epsilon.
+    """
     x = np.asarray(values, float)
     median = np.median(x)
     mad = np.median(np.abs(x - median))
     if mad < 1e-12:
-        # MAD is often zero with three repeats. Values unequal to the consensus
-        # are still unambiguous outliers.
-        return np.abs(x - median) > 1e-12
-    return 0.6745 * np.abs(x - median) / mad > threshold
+        return np.abs(x - median) > zero_mad_absolute_tolerance
+    difference = np.abs(x - median)
+    # The MAD score remains the primary rule.  The dimensional tolerance also
+    # prevents a microscopically small but non-zero MAD from amplifying harmless
+    # instrument-resolution differences into an outlier.
+    return ((0.6745 * difference / mad > threshold)
+            & (difference > zero_mad_absolute_tolerance))
 
 
 def trial_rejection_reasons(summary: dict, quality: dict | None = None, **legacy) -> list[str]:
