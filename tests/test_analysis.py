@@ -3,7 +3,7 @@ import pytest
 from analysis.reference_flow import estimate_reference_flow
 from analysis.omron_reference import OMRON_COEFFICIENTS,omron_reference
 from analysis.curve_fit import fit_model,monotonic_over,predict_checked
-from analysis.model_selection import compare_models,select_empirical_model
+from analysis.model_selection import ModelScore,compare_models,select_empirical_model
 from analysis.quality import robust_repeat_outliers
 from analysis.uncertainty import bootstrap_band
 
@@ -35,11 +35,31 @@ def test_nonlinear_can_select_complex_model():
     scores=compare_models(make_repeats(lambda u:.03*u**3+.02*u**2+.1*u))
     assert select_empirical_model(scores).name in {"quadratic","cubic"}
 
+def score(name, parameters, rmse):
+    return ModelScore(name, [], parameters, rmse, rmse, rmse, True, [], [])
+
+def test_model_selection_ignores_numerical_noise_but_accepts_real_improvement():
+    tiny = [score("linear", 2, 1e-8), score("quadratic", 3, .5e-8)]
+    assert select_empirical_model(tiny).name == "linear"
+    real = [score("linear", 2, .02), score("quadratic", 3, .01)]
+    assert select_empirical_model(real).name == "quadratic"
+
+def test_fifth_order_keeps_stronger_complexity_protection():
+    small = [score("linear", 2, .02), score("polynomial_5", 6, .018)]
+    assert select_empirical_model(small).name == "linear"
+    large = [score("linear", 2, .02), score("polynomial_5", 6, .01)]
+    assert select_empirical_model(large).name == "polynomial_5"
+
 def test_monotonicity_range_and_outlier():
     assert not monotonic_over([-1,2,0],(0,2))
     model=fit_model("linear",[1,2,3],[0,.5,1])
     with pytest.raises(ValueError):predict_checked(model,.5,(1,3))
     assert robust_repeat_outliers([1,1.01,.99,5]).tolist()==[False,False,False,True]
+
+def test_zero_mad_uses_physical_tolerance():
+    assert not robust_repeat_outliers([1, 1, 1.000001]).any()
+    assert robust_repeat_outliers([1, 1, 1.3]).tolist() == [False, False, True]
+    assert robust_repeat_outliers([1, 1.01, .99, 1.5]).tolist() == [False, False, False, True]
 
 def test_bootstrap_band():
     band=bootstrap_band(make_repeats(),"linear",iterations=100,grid_size=20,seed=3)

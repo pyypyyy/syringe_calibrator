@@ -18,6 +18,6 @@ calibration:
   max_duration_s: 60.0
 analysis: {candidate_models: [linear, quadratic, cubic, polynomial_5], include_omron_reference: true, bootstrap_iterations: 2000}
 analysis_window: {discard_start_fraction: 0.10, discard_end_fraction: 0.10}
-quality: {minimum_samples: 100, minimum_duration_s: 20.0, minimum_reference_r_squared: 0.98, maximum_regression_residual_sd_ml: 0.5, maximum_sensor_voltage_sd_v: 0.05, max_zero_sd_v: 0.01, maximum_zero_drift_v: 0.01}
+quality: {minimum_samples: 100, minimum_duration_s: 20.0, minimum_reference_r_squared: 0.98, maximum_regression_residual_sd_ml: 0.5, maximum_sensor_voltage_sd_v: 0.05, max_zero_sd_v: 0.01, maximum_zero_drift_v: 0.01, repeat_voltage_zero_mad_tolerance_v: 0.002, repeat_flow_zero_mad_tolerance_lpm: 0.005}
 safety: {min_volume_ml: 0.0, max_volume_ml: 100.0, max_position_jump_ml: 5.0, jump_persistence: 3, stall_timeout_s: 2.0, minimum_position_change_ml: 0.1, wrong_direction_tolerance_ml: 0.5}
 data_dir: data

@@ -4,6 +4,10 @@ import numpy as np
 from .curve_fit import MODEL_DEGREES, fit_model
 from .omron_reference import omron_reference
 
+# Improvements below ten microlitres/minute are numerical noise for this
+# instrument, not evidence that another polynomial parameter is useful.
+MINIMUM_ABSOLUTE_CV_RMSE_IMPROVEMENT_LPM = 1e-5
+
 @dataclass
 class ModelScore:
     name:str; coefficients:list[float]|None; parameter_count:int; cv_mae_lpm:float; cv_rmse_lpm:float
@@ -47,11 +51,21 @@ def compare_models(repeats, candidates=None):
     e=np.array([x["error_lpm"] for x in oe]); scores.append(ModelScore("omron_reference",None,0,float(np.mean(abs(e))),float(np.sqrt(np.mean(e*e))),float(max(abs(e))),True,oe,[]))
     return scores
 
-def select_empirical_model(scores, improvement_required=0.05):
+def select_empirical_model(
+    scores,
+    improvement_required=0.05,
+    absolute_improvement_floor_lpm=MINIMUM_ABSOLUTE_CV_RMSE_IMPROVEMENT_LPM,
+):
     eligible=sorted((s for s in scores if s.name!="omron_reference" and s.monotonic),key=lambda s:s.parameter_count)
     if not eligible: raise ValueError("no physically valid empirical model")
     chosen=eligible[0]
     for candidate in eligible[1:]:
         required=0.15 if candidate.name=="polynomial_5" else improvement_required
-        if candidate.cv_rmse_lpm < chosen.cv_rmse_lpm*(1-required): chosen=candidate
+        relative_ok = candidate.cv_rmse_lpm < chosen.cv_rmse_lpm * (1 - required)
+        absolute_ok = (
+            chosen.cv_rmse_lpm - candidate.cv_rmse_lpm
+            > absolute_improvement_floor_lpm
+        )
+        if relative_ok and absolute_ok:
+            chosen=candidate
     return chosen

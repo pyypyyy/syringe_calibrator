@@ -310,6 +310,10 @@ class CalibrationController:
         self._set(state=State.MEASURING)
         trial_started = time.monotonic()
         samples = self._watch_measurement(plan, trial_started)
+        # A stop can terminate the motion thread between watcher iterations.
+        # Preserve cancellation semantics instead of misreporting short partial
+        # sampling as a hardware failure.
+        self._check_stopped()
         if len(samples) < 3:
             raise MotionSafetyError("measurement produced fewer than three samples")
         _, final_position = self._safe_position()
@@ -396,8 +400,19 @@ class CalibrationController:
             if row["target_flow_lpm"] == target and row["accepted"]
         ]
         if indexes:
-            sensor = robust_repeat_outliers([summaries[index]["sensor_voltage_v"] for index in indexes])
-            flow = robust_repeat_outliers([summaries[index]["reference_flow_lpm"] for index in indexes])
+            quality = self.config.get("quality", {})
+            sensor = robust_repeat_outliers(
+                [summaries[index]["sensor_voltage_v"] for index in indexes],
+                zero_mad_absolute_tolerance=float(
+                    quality.get("repeat_voltage_zero_mad_tolerance_v", 0.002)
+                ),
+            )
+            flow = robust_repeat_outliers(
+                [summaries[index]["reference_flow_lpm"] for index in indexes],
+                zero_mad_absolute_tolerance=float(
+                    quality.get("repeat_flow_zero_mad_tolerance_lpm", 0.005)
+                ),
+            )
             for index, bad in zip(indexes, sensor | flow):
                 if bad:
                     summaries[index]["accepted"] = False
