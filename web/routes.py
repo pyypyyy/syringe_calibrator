@@ -1,8 +1,11 @@
 from datetime import datetime,timezone
 import json
+import logging
 from pathlib import Path
 from flask import Blueprint,abort,jsonify,redirect,render_template,request,send_from_directory,url_for
 from calibration.softpot_calibration import SoftPotCalibrationSession
+
+log = logging.getLogger(__name__)
 
 def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None):
     bp=Blueprint("web",__name__); sessions={}; runtime=controller if isinstance(controller,dict) else {"controller":controller}
@@ -25,7 +28,17 @@ def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None)
         try:data=session.save(path)
         except ValueError as exc:return jsonify(error=str(exc)),400
         if activate_softpot:
-            activate_softpot(data)
+            try:
+                activate_softpot(data)
+            except Exception:
+                # Keep the detailed exception in the instrument log without
+                # exposing internals or a traceback to the browser.
+                log.exception("SoftPot calibration was saved but activation failed")
+                return jsonify(
+                    error=("SoftPot calibration was saved, but the position reader "
+                           "could not be activated. Check the instrument log."),
+                    saved=True,
+                ),500
         return jsonify({**data,"message":"SoftPot calibration saved and active."})
     @bp.post("/api/calibration/start")
     def start():
