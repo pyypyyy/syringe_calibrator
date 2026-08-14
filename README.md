@@ -1,5 +1,9 @@
 # Gasflow Calibrator V2
 
+The minimum supported Python version is **3.9**. The Raspberry Pi currently
+used for the production instrument runs Python **3.9.2**; CI exercises both
+Python 3.9 and a newer Python release.
+
 A focused Raspberry Pi laboratory instrument for calibrating an **Omron D6F-P0010A1** analog flow sensor against measured motion of a motor-driven 100 ml syringe. It stores every raw trial, estimates reference flow by regression of syringe volume against time, compares empirical models using leave-one-flow-level-out validation, and reports bootstrap uncertainty.
 
 There is deliberately **no production mock mode**, environmental sensor, temperature/pressure/humidity correction, or silent hardware fallback. Tests alone use synthetic numerical data. If pigpio, the ADC, either ADC channel, or the SoftPot calibration is unavailable, the web UI remains available but calibration is disabled and the exact failure is shown.
