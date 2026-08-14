@@ -14,9 +14,10 @@ def create_app(config_path="config.yaml"):
     try:
         stepper=Stepper(config["stepper"]); hardware["stepper"]="Ready"
     except Exception as exc: hardware["errors"].append(f"Stepper/pigpio: {exc}"); stepper=None
+    adc_error=None
     try:
         adc=ADS1115(config["ads1115"]); flow=FlowSensor(adc,config["ads1115"]["flow_channel"]); hardware["flow_voltage_v"]=flow.voltage(); hardware["softpot_voltage_v"]=adc.voltage(config["ads1115"]["softpot_channel"])
-    except Exception as exc: hardware["errors"].append(f"ADS1115: {exc}"); adc=flow=None
+    except Exception as exc: adc_error=str(exc); hardware["errors"].append(f"ADS1115: {adc_error}"); adc=flow=None
     calibration=store.latest_softpot()
     if calibration and adc:
         try:
@@ -32,7 +33,8 @@ def create_app(config_path="config.yaml"):
     runtime={"controller":controller}
     def activate_softpot(data):
         if not adc:
-            raise RuntimeError("ADS1115 unavailable")
+            detail=f": {adc_error}" if adc_error else ""
+            raise RuntimeError(f"ADS1115 unavailable{detail}")
         mapping=SoftPotMapping(data["points"]); new_filter=RobustPositionFilter(mapping,config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
         def active_reader():
             voltage=adc.voltage(config["ads1115"]["softpot_channel"]); _,filtered=new_filter.update(voltage); return voltage,filtered
