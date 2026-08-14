@@ -12,7 +12,9 @@ def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None)
     def softpot(): return render_template("softpot.html",points=sessions.get("current").points if sessions.get("current") else [])
     @bp.post("/api/softpot/capture")
     def capture_softpot():
-        if not adc:return jsonify(error="ADS1115 unavailable"),503
+        if not adc:
+            detail=next((error for error in hardware["errors"] if error.startswith("ADS1115:")),None)
+            return jsonify(error=detail or "ADS1115 unavailable"),503
         channel=config["ads1115"]["softpot_channel"]
         session=sessions.setdefault("current",SoftPotCalibrationSession(lambda:adc.voltage(channel))); point=session.capture(float(request.json["volume_ml"])); return jsonify(point)
     @bp.post("/api/softpot/save")
