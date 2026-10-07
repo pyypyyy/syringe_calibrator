@@ -4,7 +4,7 @@ import yaml
 from flask import Flask
 from hardware.ads1115 import ADS1115
 from hardware.flow_sensor import FlowSensor
-from hardware.softpot import RobustPositionFilter,SoftPotMapping
+from hardware.softpot import PositionReader,SoftPotMapping
 from hardware.stepper import Stepper
 from storage.runs import RunStore
 from web.routes import create_blueprint
@@ -21,10 +21,8 @@ def create_app(config_path="config.yaml"):
     calibration=store.latest_softpot()
     if calibration and adc:
         try:
-            mapping=SoftPotMapping(calibration["points"]); filt=RobustPositionFilter(mapping,config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
-            def read_position():
-                voltage=adc.voltage(config["ads1115"]["softpot_channel"]); raw,filtered=filt.update(voltage); return voltage,filtered
-            read_position.min_calibrated_volume_ml=mapping.min_calibrated_volume_ml; read_position.max_calibrated_volume_ml=mapping.max_calibrated_volume_ml
+            mapping=SoftPotMapping(calibration["points"])
+            read_position=PositionReader(adc,config["ads1115"]["softpot_channel"],mapping,config["safety"])
             hardware["softpot_calibrated"]=True
         except Exception as exc: hardware["errors"].append(f"SoftPot calibration: {exc}")
     else: hardware["errors"].append("SoftPot calibration: no valid calibration")
@@ -35,10 +33,8 @@ def create_app(config_path="config.yaml"):
         if not adc:
             detail=f": {adc_error}" if adc_error else ""
             raise RuntimeError(f"ADS1115 unavailable{detail}")
-        mapping=SoftPotMapping(data["points"]); new_filter=RobustPositionFilter(mapping,config["safety"]["max_position_jump_ml"],config["safety"]["jump_persistence"])
-        def active_reader():
-            voltage=adc.voltage(config["ads1115"]["softpot_channel"]); _,filtered=new_filter.update(voltage); return voltage,filtered
-        active_reader.min_calibrated_volume_ml=mapping.min_calibrated_volume_ml; active_reader.max_calibrated_volume_ml=mapping.max_calibrated_volume_ml
+        mapping=SoftPotMapping(data["points"])
+        active_reader=PositionReader(adc,config["ads1115"]["softpot_channel"],mapping,config["safety"])
         if runtime["controller"]:
             runtime["controller"].install_position_reader(active_reader)
         elif flow and stepper:

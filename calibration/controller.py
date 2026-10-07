@@ -114,11 +114,11 @@ class CalibrationController:
 
     def stop(self, emergency=False):
         """Request cancellation; emergency shutdown occurs before bookkeeping."""
+        self._stop.set()
         if emergency:
             self._emergency.set()
             # Stepper.disable() calls pigpio wave_tx_stop immediately.
             self.stepper.disable()
-        self._stop.set()
         self._set(state=State.STOPPING, message="Emergency stop" if emergency else "Stop requested")
         if not emergency:
             self.stepper.disable()
@@ -127,10 +127,11 @@ class CalibrationController:
         if self._stop.is_set():
             raise InterruptedError("calibration stopped by user")
 
-    def _safe_position(self) -> tuple[float, float]:
+    def _safe_position(self, fresh=False) -> tuple[float, float]:
         """Read authoritative feedback and validate the calibrated/mechanical range."""
         try:
-            raw_voltage, volume = self.position_reader()
+            reader = getattr(self.position_reader, "fresh", self.position_reader) if fresh else self.position_reader
+            raw_voltage, volume = reader()
         except Exception as exc:
             self.stepper.disable()
             raise MotionSafetyError(f"Invalid SoftPot position feedback: {exc}") from exc
@@ -183,7 +184,7 @@ class CalibrationController:
         minimum_change = float(safety.get("minimum_position_change_ml", 0.1))
         stall_timeout = float(safety.get("stall_timeout_s", 2.0))
         wrong_tolerance = float(safety.get("wrong_direction_tolerance_ml", 0.5))
-        _, current = self._safe_position()
+        _, current = self._safe_position(fresh=True)
         expected_sign = 1 if target_ml > current else -1
         progress_position, progress_time = current, time.monotonic()
         opposite_total = 0.0
@@ -195,7 +196,7 @@ class CalibrationController:
             before = current
             self.stepper.move(steps, frequency, self._stop)
             self._check_stopped()
-            _, current = self._safe_position()
+            _, current = self._safe_position(fresh=True)
             delta = current - before
             if delta * expected_sign < 0:
                 opposite_total += abs(delta)
@@ -247,7 +248,13 @@ class CalibrationController:
         microsteps = float(self.config.get("axis", {}).get("microsteps_per_ml", 208))
         steps = round(plan.direction * plan.stroke_ml * microsteps)
         hz = plan.target_flow_lpm * 1000 / 60 * microsteps
-        motion = threading.Thread(target=self.stepper.move, args=(steps, hz, self._stop), daemon=True)
+        motion_errors = []
+        def run_motion():
+            try:
+                self.stepper.move(steps, hz, self._stop)
+            except Exception as exc:
+                motion_errors.append(exc)
+        motion = threading.Thread(target=run_motion, daemon=True)
         samples = []
         motion.start()
         last_progress = plan.start_volume_ml
@@ -297,6 +304,8 @@ class CalibrationController:
         finally:
             motion.join(timeout=2.0)
             self.stepper.disable()
+        if motion_errors:
+            raise MotionSafetyError(f"Stepper motion failed: {motion_errors[0]}") from motion_errors[0]
         return samples
 
     def execute_trial(self, plan: StrokePlan, target: float, repeat: int, started_run: float) -> tuple[dict, list[dict]]:
@@ -318,7 +327,7 @@ class CalibrationController:
         self._check_stopped()
         if len(samples) < 3:
             raise MotionSafetyError("measurement produced fewer than three samples")
-        _, final_position = self._safe_position()
+        _, final_position = self._safe_position(fresh=True)
         endpoint_tolerance = max(
             float(self.config.get("calibration", {}).get("position_tolerance_ml", 0.5)),
             float(self.config.get("calibration", {}).get("positioning_chunk_ml", 0.5)),

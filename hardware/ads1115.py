@@ -1,5 +1,8 @@
+import threading
+
 class ADS1115:
     def __init__(self, config):
+        self._lock = threading.Lock()
         channel_names = ("flow_channel", "softpot_channel")
         channels = []
         for name in channel_names:
@@ -23,4 +26,5 @@ class ADS1115:
         self._channels = {channel: AnalogIn(self._ads, channel) for channel in channels}
 
     def voltage(self, channel):
-        return float(self._channels[channel].voltage)
+        with self._lock:
+            return float(self._channels[channel].voltage)
