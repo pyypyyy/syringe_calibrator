@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
 import numpy as np
@@ -70,10 +70,12 @@ class CalibrationController:
         self.store = store
         self.config = config
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._status = Status()
         self._stop = threading.Event()
         self._emergency = threading.Event()
         self._worker = None
+        self._motion = None
         self.state_history: list[str] = []
 
     def status(self):
@@ -92,14 +94,19 @@ class CalibrationController:
                 self.state_history.append(kwargs["state"].value)
 
     def start(self, gas, targets, repeats):
-        if gas not in ("AIR", "CO2") or not targets or repeats < 1:
+        if (gas not in ("AIR", "CO2") or not targets or repeats < 1
+                or not isinstance(repeats, int)
+                or any(not np.isfinite(t) or t <= 0 for t in targets)):
             raise ValueError("invalid calibration request")
-        with self._lock:
-            if self._worker and self._worker.is_alive():
+        with self._lifecycle_lock:
+            if ((self._worker and self._worker.is_alive())
+                    or (self._motion and self._motion.is_alive())):
                 raise RuntimeError("calibration already running")
             self._stop.clear()
             self._emergency.clear()
             self.state_history.clear()
+            with self._lock:
+                self._status = Status(gas=gas, total=len(targets) * repeats)
             self._worker = threading.Thread(
                 target=self._run, args=(gas, targets, repeats), daemon=True
             )
@@ -107,21 +114,32 @@ class CalibrationController:
 
     def install_position_reader(self, position_reader):
         """Atomically activate a newly validated SoftPot mapping while idle."""
-        with self._lock:
-            if self._worker and self._worker.is_alive():
+        with self._lifecycle_lock:
+            if ((self._worker and self._worker.is_alive())
+                    or (self._motion and self._motion.is_alive())):
                 raise RuntimeError("cannot replace SoftPot mapping during calibration")
             self.position_reader = position_reader
 
     def stop(self, emergency=False):
         """Request cancellation; emergency shutdown occurs before bookkeeping."""
-        self._stop.set()
-        if emergency:
-            self._emergency.set()
-            # Stepper.disable() calls pigpio wave_tx_stop immediately.
-            self.stepper.disable()
-        self._set(state=State.STOPPING, message="Emergency stop" if emergency else "Stop requested")
-        if not emergency:
-            self.stepper.disable()
+        # A new start cannot clear cancellation before shutdown finishes.
+        with self._lifecycle_lock:
+            self._stop.set()
+            if emergency:
+                self._emergency.set()
+            try:
+                self.stepper.disable()
+            except Exception as exc:
+                self._set(state=State.FAILED, message=f"Motor shutdown failed: {exc}")
+                raise
+            with self._lock:
+                # The worker may have reached a terminal state during disable().
+                # Do not overwrite that outcome with a stale STOPPING update.
+                if self._worker and self._worker.is_alive() and self._status.state not in (
+                        State.ABORTED, State.FAILED, State.COMPLETE):
+                    self._status.state = State.STOPPING
+                    self._status.message = "Emergency stop" if emergency else "Stop requested"
+                    self.state_history.append(State.STOPPING.value)
 
     def _check_stopped(self):
         if self._stop.is_set():
@@ -133,10 +151,12 @@ class CalibrationController:
             reader = getattr(self.position_reader, "fresh", self.position_reader) if fresh else self.position_reader
             raw_voltage, volume = reader()
         except Exception as exc:
+            self._stop.set()
             self.stepper.disable()
             raise MotionSafetyError(f"Invalid SoftPot position feedback: {exc}") from exc
         low, high = self._position_bounds()
         if not np.isfinite(volume) or not low <= volume <= high:
+            self._stop.set()
             self.stepper.disable()
             raise MotionSafetyError(
                 f"SoftPot position {volume!r} ml is outside safe calibrated range {low:g}–{high:g} ml."
@@ -176,7 +196,9 @@ class CalibrationController:
         self._set(state=state)
         calibration = self.config.get("calibration", {})
         safety = self.config.get("safety", {})
-        tolerance = float(calibration.get("position_tolerance_ml", 0.5))
+        # Reserve half the acceptance tolerance for stationary sensor noise and
+        # the subsequent start/endpoint verification; do not stop on its edge.
+        tolerance = float(calibration.get("position_tolerance_ml", 0.5)) / 2
         chunk_ml = float(calibration.get("positioning_chunk_ml", 0.5))
         speed = float(calibration.get("positioning_speed_lpm", 0.1))
         microsteps = float(self.config.get("axis", {}).get("microsteps_per_ml", 208))
@@ -255,6 +277,7 @@ class CalibrationController:
             except Exception as exc:
                 motion_errors.append(exc)
         motion = threading.Thread(target=run_motion, daemon=True)
+        self._motion = motion
         samples = []
         motion.start()
         last_progress = plan.start_volume_ml
@@ -265,10 +288,13 @@ class CalibrationController:
             while motion.is_alive():
                 self._check_stopped()
                 now = time.monotonic()
+                if now - started > plan.expected_duration_s + 2.0:
+                    raise MotionSafetyError("Stepper motion timed out")
                 raw, volume = self._safe_position()
+                sampled = time.monotonic()
                 voltage = float(self.flow_sensor.voltage())
                 samples.append({
-                    "elapsed_s": now - started,
+                    "elapsed_s": sampled - started,
                     "softpot_voltage_v": raw,
                     "filtered_volume_ml": volume,
                     "flow_sensor_voltage_v": voltage,
@@ -296,14 +322,21 @@ class CalibrationController:
                         f"in {float(safety.get('stall_timeout_s', 2.0)):g} seconds."
                     )
                 previous = volume
-                self._stop.wait(float(cfg.get("sample_interval_s", 0.05)))
+                # The interval is between acquisitions, not an extra delay on
+                # top of two ADC conversions. Slow conversions still reduce
+                # sample count and remain subject to the existing quality gates.
+                next_sample = now + float(cfg.get("sample_interval_s", 0.05))
+                self._stop.wait(max(0.0, next_sample - time.monotonic()))
         except Exception:
-            self.stepper.disable()
             self._stop.set()
+            self.stepper.disable()
             raise
         finally:
             motion.join(timeout=2.0)
             self.stepper.disable()
+        if motion.is_alive():
+            self._stop.set()
+            raise MotionSafetyError("Stepper motion thread did not terminate")
         if motion_errors:
             raise MotionSafetyError(f"Stepper motion failed: {motion_errors[0]}") from motion_errors[0]
         return samples
@@ -318,6 +351,17 @@ class CalibrationController:
         self._set(state=State.SETTLING, current_target_lpm=target, repeat=repeat)
         if self._stop.wait(float(self.config.get("calibration", {}).get("settle_s", 2.0))):
             self._check_stopped()
+        self._check_stopped()
+        # The disabled axis can drift during settling. Recheck fresh feedback
+        # before enabling pulses, then command from that measured start.
+        _, reached = self._safe_position(fresh=True)
+        if abs(reached - plan.start_volume_ml) > tolerance:
+            raise MotionSafetyError("measurement start position changed during settling")
+        actual_stroke = (plan.end_volume_ml - reached) * plan.direction
+        if actual_stroke <= 0:
+            raise MotionSafetyError("measurement start is past the planned endpoint")
+        plan = replace(plan, start_volume_ml=reached, stroke_ml=actual_stroke,
+                       expected_duration_s=actual_stroke / (target * 1000 / 60))
         self._set(state=State.MEASURING)
         trial_started = time.monotonic()
         samples = self._watch_measurement(plan, trial_started)
@@ -554,13 +598,14 @@ class CalibrationController:
 
     def _run(self, gas, targets, repeats):
         started = time.monotonic()
-        run_id = self.store.create(
-            gas,
-            {"targets_lpm": targets, "repeats": repeats, "configuration": self.config},
-        )
+        run_id = None
         summaries = []
-        self._set(run_id=run_id, gas=gas, total=len(targets) * repeats, completed=0, accepted=0, rejected=0)
         try:
+            run_id = self.store.create(
+                gas,
+                {"targets_lpm": targets, "repeats": repeats, "configuration": self.config},
+            )
+            self._set(run_id=run_id, gas=gas, total=len(targets) * repeats, completed=0, accepted=0, rejected=0)
             before = self.capture_zero(State.ZERO_BEFORE)
             self.store.write_json(run_id, "zero_before.json", before)
             reasons = zero_rejection_reasons(before, self.config.get("quality", {}))
@@ -588,13 +633,22 @@ class CalibrationController:
             self.finalize_run(run_id, gas, summaries, target_info, before, after)
         except InterruptedError as exc:
             log.info("calibration aborted: %s", exc)
-            self.store.write_csv(run_id, "trial_summary.csv", summaries)
-            self.store.update_run(run_id, {"completion_state": "ABORTED", "message": str(exc)})
             self._set(state=State.ABORTED, message=str(exc))
+            if run_id is not None:
+                self.store.write_csv(run_id, "trial_summary.csv", summaries)
+                self.store.update_run(run_id, {"completion_state": "ABORTED", "message": str(exc)})
         except Exception as exc:
             log.exception("calibration failed")
-            self.store.write_csv(run_id, "trial_summary.csv", summaries)
-            self.store.update_run(run_id, {"completion_state": "FAILED", "message": str(exc)})
             self._set(state=State.FAILED, message=str(exc))
+            if run_id is not None:
+                self.store.write_csv(run_id, "trial_summary.csv", summaries)
+                self.store.update_run(run_id, {"completion_state": "FAILED", "message": str(exc)})
         finally:
-            self.stepper.disable()
+            try:
+                self.stepper.disable()
+            except Exception as exc:
+                log.exception("motor shutdown failed")
+                message = f"Motor shutdown failed: {exc}"
+                self._set(state=State.FAILED, message=message)
+                if run_id is not None:
+                    self.store.update_run(run_id, {"completion_state": "FAILED", "message": message})

@@ -1,6 +1,8 @@
 from datetime import datetime,timezone
 import json
 import logging
+import threading
+from functools import wraps
 from pathlib import Path
 from flask import Blueprint,abort,jsonify,redirect,render_template,request,send_from_directory,url_for
 from calibration.softpot_calibration import SoftPotCalibrationSession
@@ -9,14 +11,27 @@ log = logging.getLogger(__name__)
 
 def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None):
     bp=Blueprint("web",__name__); sessions={}; runtime=controller if isinstance(controller,dict) else {"controller":controller}
+    # Keep idle ADC operations and mapping changes atomic with web run startup.
+    # Stop deliberately bypasses this lock so it never waits for a capture.
+    idle_lock = threading.RLock()
+    def idle_operation(func):
+        @wraps(func)
+        def locked(*args, **kwargs):
+            with idle_lock:
+                return func(*args, **kwargs)
+        return locked
+    def running():
+        active = runtime["controller"]
+        return active and any(thread and thread.is_alive() for thread in (
+            getattr(active, "_worker", None), getattr(active, "_motion", None)))
     @bp.get("/")
     def dashboard(): return render_template("dashboard.html",hardware=hardware,history=store.history()[:1])
     @bp.get("/softpot")
     def softpot(): return render_template("softpot.html",points=sessions.get("current").points if sessions.get("current") else [])
     @bp.post("/api/softpot/capture")
+    @idle_operation
     def capture_softpot():
-        active=runtime["controller"]
-        if active and active._worker and active._worker.is_alive():
+        if running():
             return jsonify(error="Stop calibration before capturing SoftPot points"),409
         if not adc:
             detail=next((error for error in hardware["errors"] if error.startswith("ADS1115:")),None)
@@ -24,7 +39,10 @@ def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None)
         channel=config["ads1115"]["softpot_channel"]
         session=sessions.setdefault("current",SoftPotCalibrationSession(lambda:adc.voltage(channel))); point=session.capture(float(request.json["volume_ml"])); return jsonify(point)
     @bp.post("/api/softpot/save")
+    @idle_operation
     def save_softpot():
+        if running():
+            return jsonify(error="Stop calibration before saving SoftPot points"),409
         session=sessions.get("current")
         if not session:return jsonify(error="no points captured"),400
         path=store.root/"softpot"/f"softpot_calibration_{datetime.now(timezone.utc):%Y-%m-%d_%H%M%S}.json"
@@ -44,22 +62,35 @@ def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None)
                 ),500
         return jsonify({**data,"message":"SoftPot calibration saved and active."})
     @bp.post("/api/calibration/start")
+    @idle_operation
     def start():
         active=runtime["controller"]
         if not active:return jsonify(error="hardware is not ready",hardware=hardware),503
-        data=request.json; active.start(data["gas"],[float(v) for v in data["targets_lpm"]],int(data["repeats"])); return jsonify(active.status()),202
+        try:
+            data=request.json
+            active.start(data["gas"],[float(v) for v in data["targets_lpm"]],int(data["repeats"]))
+        except (ValueError, TypeError, KeyError) as exc:
+            return jsonify(error=f"Invalid calibration request: {exc}"),400
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)),409
+        return jsonify(active.status()),202
     @bp.post("/api/calibration/stop")
     def stop():
-        if runtime["controller"]:runtime["controller"].stop(bool((request.json or {}).get("emergency")))
+        if runtime["controller"]:
+            try:
+                runtime["controller"].stop(bool((request.json or {}).get("emergency")))
+            except Exception as exc:
+                return jsonify(error=f"Motor shutdown failed: {exc}"),503
         return jsonify(ok=True)
     @bp.get("/api/status")
     def status(): return jsonify(runtime["controller"].status() if runtime["controller"] else {"state":"HARDWARE_ERROR","hardware":hardware})
     @bp.get("/api/sensors")
+    @idle_operation
     def sensors():
         active=runtime["controller"]
         current=active.status() if active else {}
         # Do not add I2C traffic to the measurement sampling loop.
-        if active and active._worker and active._worker.is_alive():
+        if running():
             return jsonify(flow_voltage_v=current.get("sensor_voltage_v"),
                            position_ml=current.get("position_ml"), source="calibration")
         if not adc:

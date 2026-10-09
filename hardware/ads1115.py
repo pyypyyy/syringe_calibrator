@@ -1,4 +1,5 @@
 import threading
+import time
 
 class ADS1115:
     def __init__(self, config):
@@ -18,7 +19,18 @@ class ADS1115:
         import adafruit_ads1x15.ads1115 as ads
         from adafruit_ads1x15.analog_in import AnalogIn
 
-        self._ads = ads.ADS1115(
+        class TimedADS1115(ads.ADS1115):
+            # The upstream single-shot driver polls this method indefinitely.
+            # Bound that polling without replacing its conversion/MUX logic.
+            _conversion_deadline = None
+
+            def _conversion_complete(self):
+                if (self._conversion_deadline is not None
+                        and time.monotonic() >= self._conversion_deadline):
+                    raise TimeoutError("ADS1115 conversion timed out")
+                return super()._conversion_complete()
+
+        self._ads = TimedADS1115(
             busio.I2C(board.SCL, board.SDA),
             address=int(config["address"]),
             gain=config.get("gain", 1),
@@ -27,4 +39,8 @@ class ADS1115:
 
     def voltage(self, channel):
         with self._lock:
-            return float(self._channels[channel].voltage)
+            self._ads._conversion_deadline = time.monotonic() + 1.0
+            try:
+                return float(self._channels[channel].voltage)
+            finally:
+                self._ads._conversion_deadline = None

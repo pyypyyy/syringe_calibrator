@@ -1,6 +1,7 @@
 """Finite pigpio moves for the directly connected, optoisolated TB6600."""
 import math
 import threading
+import time
 
 
 class Stepper:
@@ -11,20 +12,21 @@ class Stepper:
         self._move_lock = threading.Lock()
         self.pi = pigpio.pi()
         if not self.pi.connected:
+            self.pi.stop()
             raise RuntimeError("pigpio daemon unavailable")
         try:
             pins = [config[name] for name in ("step_pin", "dir_pin", "enable_pin")]
             if len(set(pins)) != 3 or any(not isinstance(p, int) or not 0 <= p <= 27 for p in pins):
                 raise ValueError("Stepper requires three distinct GPIOs in bank 0 (0–27)")
+            # Disable before any later initialization/verification can fail.
+            self._check(self.pi.write(config["enable_pin"], self._disabled_level), "disable driver")
+            self._check(self.pi.write(config["step_pin"], 0), "clear STEP")
             strength = config.get("drive_strength_ma", 12)
             if strength not in range(2, 17, 2):
                 raise ValueError("drive_strength_ma must be an even value from 2 to 16")
             self._check(self.pi.set_pad_strength(0, strength), "set GPIO drive strength")
             if self.pi.get_pad_strength(0) != strength:
                 raise RuntimeError("GPIO drive-strength verification failed")
-            # Set the output latch before enabling the output to avoid an enable glitch.
-            self._check(self.pi.write(config["enable_pin"], self._disabled_level), "disable driver")
-            self._check(self.pi.write(config["step_pin"], 0), "clear STEP")
             for pin in pins:
                 self._check(self.pi.set_mode(pin, pigpio.OUTPUT), "configure GPIO")
             self.disable()
@@ -45,12 +47,12 @@ class Stepper:
     def disable(self):
         with self._lock:
             try:
-                self.pi.wave_tx_stop()
+                self._check(self.pi.wave_tx_stop(), "stop waves")
             finally:
                 try:
-                    self.pi.write(self.cfg["step_pin"], 0)
+                    self._check(self.pi.write(self.cfg["step_pin"], 0), "clear STEP")
                 finally:
-                    self.pi.write(self.cfg["enable_pin"], self._disabled_level)
+                    self._check(self.pi.write(self.cfg["enable_pin"], self._disabled_level), "disable driver")
 
     def move(self, steps, frequency_hz, stop_event):
         import pigpio
@@ -83,13 +85,21 @@ class Stepper:
                     if stop_event.is_set():
                         return
                     self._check(self.pi.wave_chain([255, 0, wid, 255, 1, count & 255, count >> 8]), "start wave")
-                while self.pi.wave_tx_busy() and not stop_event.wait(.005):
-                    pass
+                deadline = time.monotonic() + count * period / 1_000_000 + 2.0
+                while self._check(self.pi.wave_tx_busy(), "query wave status"):
+                    if stop_event.wait(.005):
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("Stepper wave timed out")
             finally:
-                self.disable()
-                if wid is not None:
-                    self.pi.wave_delete(wid)
+                try:
+                    self.disable()
+                finally:
+                    if wid is not None:
+                        self._check(self.pi.wave_delete(wid), "delete wave")
 
     def close(self):
-        self.disable()
-        self.pi.stop()
+        try:
+            self.disable()
+        finally:
+            self.pi.stop()
