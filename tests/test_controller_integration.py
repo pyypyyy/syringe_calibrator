@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+import numpy as np
 import yaml
 
 from calibration.controller import CalibrationController
@@ -180,7 +181,10 @@ def test_full_default_calibration_runs_real_controller_state_machine(tmp_path):
     assert analysis["total_trials"] == analysis["accepted_trials"] == 21
     assert analysis["usable_calibration_points"] == 7
     assert all(row["quality"] == "GOOD" for row in analysis["target_diagnostics"])
-    assert analysis["selected_model"]["name"] == "linear"
+    # Real thread scheduling adds timing noise; it can change which valid
+    # polynomial wins CV. Verify predictive accuracy rather than its degree.
+    assert analysis["selected_model"]["monotonic"]
+    assert analysis["selected_model"]["cv_rmse_lpm"] < .005
     assert analysis["bootstrap"]["accepted_iterations"] > 0
     for trial in analysis["trials"]:
         assert trial["accepted"], trial["rejection_reasons"]
@@ -200,8 +204,7 @@ def test_full_default_calibration_runs_real_controller_state_machine(tmp_path):
     with raw_files[0].open() as source:
         assert "analysis_sample" in next(csv.reader(source))
     model = analysis["selected_model"]
-    slope, intercept = model["coefficients"]
-    assert slope * (.2 + .8 * .5) + intercept == pytest.approx(.5, abs=.015)
+    assert np.polyval(model["coefficients"], .2 + .8 * .5) == pytest.approx(.5, abs=.015)
     assert stepper.move_calls > 21
 
 

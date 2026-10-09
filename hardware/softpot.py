@@ -6,6 +6,8 @@ class SoftPotMapping:
         self.points=sorted(points,key=lambda p:p["mean_voltage_v"]); volumes=[p["volume_ml"] for p in self.points]
         delta=np.diff(volumes)
         voltages=np.asarray([p["mean_voltage_v"] for p in self.points],float)
+        if not np.all(np.isfinite(voltages)) or not np.all(np.isfinite(volumes)):
+            raise ValueError("SoftPot calibration points must be finite")
         if len(points)<3 or not (np.all(delta>0) or np.all(delta<0)): raise ValueError("SoftPot mapping must contain at least three monotonic points")
         if np.any(np.diff(voltages)<=1e-6): raise ValueError("SoftPot voltages must be distinct")
         if np.ptp(voltages)<0.25: raise ValueError("SoftPot voltage span is inadequate")
@@ -31,16 +33,26 @@ class PositionReader:
         self.filter = RobustPositionFilter(mapping, safety["max_position_jump_ml"], safety["jump_persistence"])
         self.min_calibrated_volume_ml = mapping.min_calibrated_volume_ml
         self.max_calibrated_volume_ml = mapping.max_calibrated_volume_ml
+        self._safe_low = safety.get("min_volume_ml", self.min_calibrated_volume_ml)
+        self._safe_high = safety.get("max_volume_ml", self.max_calibrated_volume_ml)
+
+    def _validate_raw(self, volume):
+        if not self._safe_low <= volume <= self._safe_high:
+            raise PositionOutOfRange("Raw SoftPot position outside mechanical range")
 
     def __call__(self):
         voltage = self.adc.voltage(self.channel)
-        _, filtered = self.filter.update(voltage)
+        raw, filtered = self.filter.update(voltage)
+        # A median lag must never conceal a raw reading beyond the travel limits.
+        self._validate_raw(raw)
         return voltage, filtered
 
     def fresh(self):
         # Each ADC read performs a new conversion. Validate every raw reading.
         voltages = [self.adc.voltage(self.channel) for _ in range(5)]
         volumes = [self.filter.mapping.volume(v) for v in voltages]
+        for volume in volumes:
+            self._validate_raw(volume)
         if max(volumes) - min(volumes) > self.filter.max_jump:
             raise ValueError("Unstable stationary SoftPot feedback")
         self.filter.window.clear()
