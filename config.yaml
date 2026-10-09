@@ -1,6 +1,6 @@
 server: {host: "0.0.0.0", port: 5000}
 ads1115: {address: 0x48, flow_channel: 1, softpot_channel: 2, gain: 1}
-stepper: {step_pin: 18, dir_pin: 4, enable_pin: 21, enable_active_low: true, invert_direction: false}
+stepper: {step_pin: 18, dir_pin: 4, enable_pin: 21, enable_active_low: true, invert_direction: false, drive_strength_ma: 12}
 axis: {syringe_volume_ml: 100.0, microsteps_per_ml: 208.0}
 calibration:
   target_flows_lpm: [0.02, 0.05, 0.10, 0.25, 0.50, 0.75, 1.00]

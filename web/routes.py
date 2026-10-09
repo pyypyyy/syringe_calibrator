@@ -15,6 +15,9 @@ def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None)
     def softpot(): return render_template("softpot.html",points=sessions.get("current").points if sessions.get("current") else [])
     @bp.post("/api/softpot/capture")
     def capture_softpot():
+        active=runtime["controller"]
+        if active and active._worker and active._worker.is_alive():
+            return jsonify(error="Stop calibration before capturing SoftPot points"),409
         if not adc:
             detail=next((error for error in hardware["errors"] if error.startswith("ADS1115:")),None)
             return jsonify(error=detail or "ADS1115 unavailable"),503
@@ -51,6 +54,22 @@ def create_blueprint(store,controller,hardware,adc,config,activate_softpot=None)
         return jsonify(ok=True)
     @bp.get("/api/status")
     def status(): return jsonify(runtime["controller"].status() if runtime["controller"] else {"state":"HARDWARE_ERROR","hardware":hardware})
+    @bp.get("/api/sensors")
+    def sensors():
+        active=runtime["controller"]
+        current=active.status() if active else {}
+        # Do not add I2C traffic to the measurement sampling loop.
+        if active and active._worker and active._worker.is_alive():
+            return jsonify(flow_voltage_v=current.get("sensor_voltage_v"),
+                           position_ml=current.get("position_ml"), source="calibration")
+        if not adc:
+            return jsonify(error="ADS1115 unavailable"),503
+        try:
+            return jsonify(flow_voltage_v=adc.voltage(config["ads1115"]["flow_channel"]),
+                           softpot_voltage_v=adc.voltage(config["ads1115"]["softpot_channel"]),
+                           source="live")
+        except Exception as exc:
+            return jsonify(error=f"Sensor read failed: {exc}"),503
     @bp.get("/calibration")
     def calibration(): return render_template("calibration.html")
     @bp.get("/history")

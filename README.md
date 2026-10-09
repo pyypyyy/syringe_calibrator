@@ -60,3 +60,58 @@ Development checks:
 pip install -r requirements.txt pytest
 pytest
 ```
+
+## Current TB6600 wiring and commissioning
+
+The current configuration is for a Raspberry Pi 3B and **direct 3.3 V,
+common-cathode** TB6600 inputs. The supplied driver manual accepts 3.3 V
+control; the measured PUL input current is approximately 10 mA. Verify DIR
+and ENA input currents too. This is not a universal wiring recommendation
+for every device sold as TB6600.
+
+| TB6600 terminal | Pi connection |
+|---|---|
+| PUL+ | GPIO18, physical pin 12 |
+| DIR+ | GPIO4, physical pin 7 |
+| ENA+ | GPIO21, physical pin 40 |
+| PUL−, DIR−, ENA− | Pi GND, e.g. physical pin 6 |
+| VCC / power GND | External motor supply positive / negative |
+
+Do not connect the control positives to 5 V in this arrangement. The
+optoisolated control return does not require a connection to motor-supply
+negative. GPIO4 must not simultaneously be assigned to a 1-Wire overlay.
+
+The separate ADS1115 remains at `0x48`, Omron output on **A1**, SoftPot wiper
+on **A2**. The custom Omron PCB is currently bypassed. Pi I2C uses physical
+pins 3 (SDA/GPIO2) and 5 (SCL/GPIO3).
+
+`stepper.drive_strength_ma: 12` is applied and read back at application
+startup through pigpio. This is a **GPIO bank 0 (GPIO0–27)** setting, not a
+per-pin current limiter. It does not change the 3.3 V signal voltage or force
+12 mA through a load. Configuration failures disable calibration. Do not run
+other motor-control programs alongside this application's pigpio waves.
+
+`enable_active_low: true` is retained: GPIO21 LOW is the requested motor-enabled
+state, HIGH is disabled. The optocoupler wiring diagram alone does not establish
+whether the driver's ENA input releases or energizes the motor. Verify that
+startup/Stop actually releases the motor, and change this setting only if the
+physical driver behaves oppositely. Likewise verify `invert_direction` and the
+DIP-switch microstep setting against `microsteps_per_ml: 208.0`; that numerical
+value is a mechanical calibration, not a universal TB6600 setting.
+
+Start with motor power disconnected. Launch the app and check the live flow
+and SoftPot voltages on the dashboard. Calibrate the SoftPot at known syringe
+volumes; use only reachable points and never force a mechanical endpoint.
+The current UI has no manual jog control. Verify direction, motor enable,
+travel clearances and stopping under supervision before a complete calibration.
+A single-target run can test motion, but cannot produce a valid fitted model:
+model fitting requires at least three usable levels and two accepted repeats
+per level. High-flow runs are short with a 100 ml syringe and need physical
+validation for pneumatic transients and missed steps.
+
+Stationary positioning and endpoint checks now acquire five fresh ADC samples
+and reset the streaming filter. In-motion readings keep the median filter.
+Dashboard polling reads the ADC only while idle; during a run it displays the
+controller's latest samples, avoiding additional measurement-loop I2C traffic.
+Automated tests use simulated hardware; they do not certify physical wiring,
+ENA polarity, gas tightness or calibration accuracy.

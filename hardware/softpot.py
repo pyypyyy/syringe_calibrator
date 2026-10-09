@@ -22,3 +22,29 @@ class RobustPositionFilter:
             self.pending+=1
             if self.pending<self.persistence:return raw,self.last
         self.pending=0; self.last=candidate; return raw,candidate
+
+
+class PositionReader:
+    """Streaming filter during motion; fresh stationary samples at move boundaries."""
+    def __init__(self, adc, channel, mapping, safety):
+        self.adc, self.channel = adc, channel
+        self.filter = RobustPositionFilter(mapping, safety["max_position_jump_ml"], safety["jump_persistence"])
+        self.min_calibrated_volume_ml = mapping.min_calibrated_volume_ml
+        self.max_calibrated_volume_ml = mapping.max_calibrated_volume_ml
+
+    def __call__(self):
+        voltage = self.adc.voltage(self.channel)
+        _, filtered = self.filter.update(voltage)
+        return voltage, filtered
+
+    def fresh(self):
+        # Each ADC read performs a new conversion. Validate every raw reading.
+        voltages = [self.adc.voltage(self.channel) for _ in range(5)]
+        volumes = [self.filter.mapping.volume(v) for v in voltages]
+        if max(volumes) - min(volumes) > self.filter.max_jump:
+            raise ValueError("Unstable stationary SoftPot feedback")
+        self.filter.window.clear()
+        self.filter.window.extend(volumes)
+        self.filter.last = float(np.median(volumes))
+        self.filter.pending = 0
+        return float(np.median(voltages)), self.filter.last
