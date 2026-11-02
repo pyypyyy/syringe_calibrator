@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
+from copy import deepcopy
 from enum import Enum
 
 import numpy as np
@@ -58,6 +59,18 @@ class Status:
     position_ml: float | None = None
     sensor_voltage_v: float | None = None
     message: str = ""
+    repeats_total: int = 0
+    target_index: int = 0
+    target_count: int = 0
+    zero_before_completed: bool = False
+    zero_after_completed: bool = False
+    analysis_completed: bool = False
+    operation_start_position_ml: float | None = None
+    operation_target_position_ml: float | None = None
+    operation_duration_s: float | None = None
+    operation_phase: str | None = None
+    failure_operation: str | None = None
+    last_completed_trial: dict | None = None
 
 
 class CalibrationController:
@@ -77,21 +90,109 @@ class CalibrationController:
         self._worker = None
         self._motion = None
         self.state_history: list[str] = []
+        self._operation_started = time.monotonic()
+        self._operation_elapsed = 0.0
+        self._operation_progress = None
 
     def status(self):
+        """Snapshot only: never acquire hardware or estimate completion from speed.
+
+        Overall milestones have equal weight: zero-before, each returned trial,
+        zero-after, and durable successful analysis. Failed/aborted runs retain
+        completed milestones. Motion display uses a high-water mark to suppress
+        SoftPot jitter; the measured position itself is never smoothed here.
+        """
         with self._lock:
-            status = asdict(self._status)
-            status["state"] = self._status.state.value
-            status["progress"] = self._status.completed / self._status.total if self._status.total else 0
+            current = self._status
+            status = asdict(current)
+            state = current.state
+            status["state"] = state.value
+            milestones = (current.completed + int(current.zero_before_completed)
+                          + int(current.zero_after_completed) + int(current.analysis_completed))
+            status["progress"] = milestones / (current.total + 3) if current.total else 0
+            status["remaining"] = max(0, current.total - current.completed)
+            terminal = state in (State.COMPLETE, State.FAILED, State.ABORTED, State.STOPPING,
+                                 State.IDLE, State.HARDWARE_ERROR)
+            elapsed = self._operation_elapsed if terminal else time.monotonic() - self._operation_started
+            status["operation_elapsed_s"] = max(0.0, elapsed)
+            duration = current.operation_duration_s
+            status["operation_remaining_s"] = (max(0.0, duration - elapsed)
+                                                if duration is not None else None)
+            progress = None
+            start, target, position = (current.operation_start_position_ml,
+                                       current.operation_target_position_ml, current.position_ml)
+            if not terminal:
+                if state in (State.POSITIONING, State.MEASURING, State.RETURNING):
+                    if all(v is not None and np.isfinite(v) for v in (start, target, position)):
+                        if target != start:
+                            progress = min(1.0, max(0.0, (position - start) / (target - start)))
+                        elif position == target:
+                            progress = 1.0
+                elif duration is not None:
+                    progress = min(1.0, max(0.0, elapsed / duration)) if duration > 0 else 1.0
+                if progress is not None:
+                    self._operation_progress = max(self._operation_progress or 0.0, progress)
+            status["operation_progress"] = (self._operation_progress
+                                            if terminal or progress is not None else None)
+            status["operation_direction"] = (
+                "Increasing volume" if target > start else "Decreasing volume" if target < start else "Stationary"
+            ) if start is not None and target is not None else None
+            descriptions = {
+                State.IDLE: "Ready to start calibration",
+                State.ZERO_BEFORE: "Measuring zero-flow sensor voltage before calibration",
+                State.ZERO_AFTER: "Measuring zero-flow sensor voltage after calibration",
+                State.POSITIONING: "Moving piston to starting position",
+                State.SETTLING: "Allowing the system to settle — piston stopped",
+                State.MEASURING: "Measuring sensor response" + (
+                    f" at {current.current_target_lpm:.3f} L/min" if current.current_target_lpm is not None else ""),
+                State.RETURNING: "Returning piston to starting position",
+                State.ANALYZING: "Calculating calibration curve and uncertainty",
+                State.COMPLETE: "Calibration completed successfully",
+                State.STOPPING: "Stop requested — stopping motor and terminating calibration",
+                State.ABORTED: "Calibration stopped by user",
+                State.FAILED: "Calibration failed",
+                State.HARDWARE_ERROR: "Hardware is not ready",
+            }
+            status["operation_description"] = descriptions[state]
             return status
 
     def _set(self, **kwargs):
         with self._lock:
             old = self._status.state
+            state = kwargs.get("state", old)
+            # Keep Stop visible while the worker unwinds. Hardware cancellation
+            # remains owned by the existing event and stepper shutdown path.
+            if old == State.STOPPING and state not in (State.ABORTED, State.FAILED, State.COMPLETE):
+                kwargs = {key: value for key, value in kwargs.items()
+                          if key != "state" and not key.startswith("operation_")}
+                state = old
+            if state != old:
+                if old not in (State.STOPPING, State.FAILED, State.ABORTED, State.COMPLETE):
+                    self._operation_elapsed = time.monotonic() - self._operation_started
+                if state == State.FAILED and self._status.failure_operation is None:
+                    self._status.failure_operation = old.value
+                if state not in (State.FAILED, State.ABORTED, State.STOPPING, State.COMPLETE):
+                    self._operation_started = time.monotonic()
+                    self._operation_progress = None
+                    self._status.operation_start_position_ml = None
+                    self._status.operation_target_position_ml = None
+                    self._status.operation_duration_s = None
+                    self._status.operation_phase = None
+            if state == State.COMPLETE:
+                self._status.analysis_completed = True
             for key, value in kwargs.items():
                 setattr(self._status, key, value)
             if "state" in kwargs and kwargs["state"] != old:
                 self.state_history.append(kwargs["state"].value)
+
+    def _zero_phase(self, phase, duration):
+        with self._lock:
+            if self._status.state == State.STOPPING:
+                return
+            self._status.operation_phase = phase
+            self._status.operation_duration_s = duration
+            self._operation_started = time.monotonic()
+            self._operation_progress = None
 
     def start(self, gas, targets, repeats):
         if (gas not in ("AIR", "CO2") or not targets or repeats < 1
@@ -106,7 +207,11 @@ class CalibrationController:
             self._emergency.clear()
             self.state_history.clear()
             with self._lock:
-                self._status = Status(gas=gas, total=len(targets) * repeats)
+                self._status = Status(gas=gas, total=len(targets) * repeats,
+                                      repeats_total=repeats, target_count=len(targets))
+                self._operation_started = time.monotonic()
+                self._operation_elapsed = 0.0
+                self._operation_progress = None
             self._worker = threading.Thread(
                 target=self._run, args=(gas, targets, repeats), daemon=True
             )
@@ -137,6 +242,9 @@ class CalibrationController:
                 # Do not overwrite that outcome with a stale STOPPING update.
                 if self._worker and self._worker.is_alive() and self._status.state not in (
                         State.ABORTED, State.FAILED, State.COMPLETE):
+                    if self._status.state != State.STOPPING:
+                        self._operation_elapsed = time.monotonic() - self._operation_started
+                        self._status.failure_operation = self._status.state.value
                     self._status.state = State.STOPPING
                     self._status.message = "Emergency stop" if emergency else "Stop requested"
                     self.state_history.append(State.STOPPING.value)
@@ -193,7 +301,7 @@ class CalibrationController:
     def move_to_volume(self, target_ml: float, state: State = State.POSITIONING) -> float:
         """Move in feedback-controlled chunks with direction and stall watchdogs."""
         self._validate_target(target_ml)
-        self._set(state=state)
+        self._set(state=state, operation_target_position_ml=target_ml)
         calibration = self.config.get("calibration", {})
         safety = self.config.get("safety", {})
         # Reserve half the acceptance tolerance for stationary sensor noise and
@@ -207,6 +315,7 @@ class CalibrationController:
         stall_timeout = float(safety.get("stall_timeout_s", 2.0))
         wrong_tolerance = float(safety.get("wrong_direction_tolerance_ml", 0.5))
         _, current = self._safe_position(fresh=True)
+        self._set(operation_start_position_ml=current, operation_target_position_ml=target_ml)
         expected_sign = 1 if target_ml > current else -1
         progress_position, progress_time = current, time.monotonic()
         opposite_total = 0.0
@@ -246,15 +355,19 @@ class CalibrationController:
         self._set(state=state)
         self.stepper.disable()
         calibration = self.config.get("calibration", {})
+        self._zero_phase("settling", float(calibration.get("settle_s", 2.0)))
         if self._stop.wait(float(calibration.get("settle_s", 2.0))):
             self._check_stopped()
+        self._zero_phase("recording", float(calibration.get("zero_duration_s", 5.0)))
         values = []
         started = time.monotonic()
         end = started + float(calibration.get("zero_duration_s", 5.0))
         interval = float(calibration.get("sample_interval_s", 0.05))
         while time.monotonic() < end:
             self._check_stopped()
-            values.append(self.flow_sensor.voltage())
+            voltage = self.flow_sensor.voltage()
+            values.append(voltage)
+            self._set(sensor_voltage_v=float(voltage))
             self._stop.wait(interval)
         duration = time.monotonic() - started
         return {
@@ -342,13 +455,15 @@ class CalibrationController:
         return samples
 
     def execute_trial(self, plan: StrokePlan, target: float, repeat: int, started_run: float) -> tuple[dict, list[dict]]:
+        self._set(current_target_lpm=target, repeat=repeat)
         self._validate_target(plan.start_volume_ml)
         self._validate_target(plan.end_volume_ml)
         reached = self.move_to_volume(plan.start_volume_ml, State.POSITIONING)
         tolerance = float(self.config.get("calibration", {}).get("position_tolerance_ml", 0.5))
         if abs(reached - plan.start_volume_ml) > tolerance:
             raise MotionSafetyError("measurement start position was not reached within tolerance")
-        self._set(state=State.SETTLING, current_target_lpm=target, repeat=repeat)
+        self._set(state=State.SETTLING,
+                  operation_duration_s=float(self.config.get("calibration", {}).get("settle_s", 2.0)))
         if self._stop.wait(float(self.config.get("calibration", {}).get("settle_s", 2.0))):
             self._check_stopped()
         self._check_stopped()
@@ -362,7 +477,8 @@ class CalibrationController:
             raise MotionSafetyError("measurement start is past the planned endpoint")
         plan = replace(plan, start_volume_ml=reached, stroke_ml=actual_stroke,
                        expected_duration_s=actual_stroke / (target * 1000 / 60))
-        self._set(state=State.MEASURING)
+        self._set(state=State.MEASURING, operation_start_position_ml=plan.start_volume_ml,
+                  operation_target_position_ml=plan.end_volume_ml)
         trial_started = time.monotonic()
         samples = self._watch_measurement(plan, trial_started)
         # A stop can terminate the motion thread between watcher iterations.
@@ -382,6 +498,8 @@ class CalibrationController:
                 f"observed {final_position:.3f} ml"
             )
         summary = self.analyze_trial(plan, target, repeat, samples)
+        # Authoritative stationary endpoint readings, not commanded displacement.
+        summary["measured_stroke_ml"] = abs(final_position - reached)
         self._set(elapsed_s=time.monotonic() - started_run)
         return summary, samples
 
@@ -589,6 +707,7 @@ class CalibrationController:
         completion = "FAILED" if status == "FAILED" else "COMPLETE"
         self.store.update_run(run_id, {"completion_state": completion, "analysis_status": status,
                                        "message": "; ".join(failures or warnings)})
+        self._check_stopped()
         self._set(
             state=State.FAILED if status == "FAILED" else State.COMPLETE,
             accepted=len(accepted),
@@ -611,25 +730,33 @@ class CalibrationController:
             reasons = zero_rejection_reasons(before, self.config.get("quality", {}))
             if reasons:
                 raise MotionSafetyError("Unstable zero-before: " + "; ".join(reasons))
+            self._set(zero_before_completed=True)
             target_info = []
-            for target in targets:
+            for target_index, target in enumerate(targets, 1):
+                self._set(current_target_lpm=target, target_index=target_index, repeat=1)
                 plan = self.create_trial_plan(target)
                 for repeat in range(1, repeats + 1):
                     self._check_stopped()
                     summary, samples = self.execute_trial(plan, target, repeat, started)
                     summaries.append(summary)
                     self.store.write_csv(run_id, f"trials/{summary['trial_id']}.csv", samples)
+                    # Operational completion requires the return, even if trial QC rejected data.
+                    self.move_to_volume(plan.start_volume_ml, State.RETURNING)
+                    self._check_stopped()
                     self._set(
                         completed=len(summaries),
                         accepted=sum(row["accepted"] for row in summaries),
                         rejected=sum(not row["accepted"] for row in summaries),
+                        last_completed_trial=deepcopy(summary),
                     )
-                    # Explicitly return after every repeat. The next trial still
-                    # verifies/repositions, so feedback rather than step counts wins.
-                    self.move_to_volume(plan.start_volume_ml, State.RETURNING)
                 target_info.append(self.evaluate_target_repeats(summaries, target, repeats))
+                self._set(last_completed_trial=deepcopy(summaries[-1]),
+                          accepted=sum(row["accepted"] for row in summaries),
+                          rejected=sum(not row["accepted"] for row in summaries))
             after = self.capture_zero(State.ZERO_AFTER)
             self.store.write_json(run_id, "zero_after.json", after)
+            self._set(zero_after_completed=True)
+            self._check_stopped()
             self.finalize_run(run_id, gas, summaries, target_info, before, after)
         except InterruptedError as exc:
             log.info("calibration aborted: %s", exc)

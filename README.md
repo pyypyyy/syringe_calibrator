@@ -115,3 +115,73 @@ Dashboard polling reads the ADC only while idle; during a run it displays the
 controller's latest samples, avoiding additional measurement-loop I2C traffic.
 Automated tests use simulated hardware; they do not certify physical wiring,
 ENA polarity, gas tightness or calibration accuracy.
+
+## Calibration progress interface (Stage 1)
+
+The calibration page keeps the current operation separate from the last completed
+trial. It polls only `/api/status`, every 500 ms after the previous request
+finishes. No browser request adds ADC samples. Stop and Emergency Stop keep their
+existing motor shutdown path. Results remain available through an explicit link,
+so completion no longer immediately hides the progress page.
+
+Overall progress is a fraction from 0 to 1. Every milestone has equal weight:
+initial zero capture saved and validated, each trial's measurement **and successful
+return**, final zero capture saved, and successful analysis with persisted results.
+For N trials the denominator is N + 3. A QC-rejected trial still completes its
+operational milestone after returning. Failed analysis does not complete the
+last milestone. Failed and aborted runs retain completed milestones; progress is
+not an elapsed-time estimate. The accepted/rejected counts can change when the
+existing target-level repeat outlier checks run.
+
+The existing status fields remain available. Additive `/api/status` fields:
+
+| Field | Meaning |
+|---|---|
+| `remaining` | Trials that have not completed measurement and return |
+| `target_index`, `target_count`, `repeats_total` | One-based target context and requested repeat count; index/repeat 0 means none yet |
+| `zero_before_completed`, `zero_after_completed`, `analysis_completed` | Completed overall milestones |
+| `operation_description` | Human-readable current activity |
+| `operation_progress` | Fraction 0–1, or null when progress is indeterminate |
+| `operation_elapsed_s` | Monotonic elapsed time in the operation, or current zero subphase; frozen on stop/termination |
+| `operation_duration_s`, `operation_remaining_s` | Configured settling/zero phase duration and remaining time; null for motion/analysis |
+| `operation_start_position_ml` | Measured starting position used for motion progress |
+| `operation_target_position_ml` | Commanded piston destination, never a measured displacement |
+| `operation_direction` | Increasing/decreasing volume, stationary, or null |
+| `operation_phase` | `settling` or `recording` for zero capture; otherwise null |
+| `failure_operation` | Operation interrupted by stop or failure; null when none |
+| `last_completed_trial` | Snapshot of the latest trial that also returned successfully, including existing QC results |
+
+Motion progress uses measured displacement from the operation start toward its
+commanded endpoint, clamped to 0–1. A display-only high-water mark prevents small
+SoftPot fluctuations from making the bar oscillate. Measured position remains
+unchanged, and all safety checks continue using the existing feedback. Bars reset
+for each operation; zero capture separately resets between settling and recording.
+Analysis is indeterminate. Terminal states stop progress animation. Missing values
+appear as a dash, and a lost connection marks retained measurements as stale.
+
+`last_completed_trial.measured_stroke_ml` is an additive saved trial-summary field:
+the absolute difference between the existing fresh measured start and endpoint.
+The original `stroke_ml`, `stroke_start_ml`, and `stroke_end_ml` retain their
+existing meanings. Initial trial acceptance may be revised by repeat outlier QC.
+No fitting, uncertainty, sampling, filtering, waveform, or mechanical settings
+are changed by this interface.
+
+To verify on the Raspberry Pi under the normal commissioning precautions:
+
+1. Start one application process and begin a calibration with valid hardware and
+   SoftPot mapping. Check that the initial zero distinguishes settling from recording.
+2. Watch Positioning → Settling → Measuring → Returning on each repeat. Compare
+   the measured position with the commanded target; check requested flow, repeat,
+   latest Omron voltage, and elapsed operation time.
+3. Confirm completed trials increase only after return and that the previous
+   trial summary remains visible during the next trial. Overall progress must stay
+   below 100% during final zero and analysis; inspect the result link on completion.
+4. On separate supervised runs, verify Stop and Emergency Stop show stopping and
+   then a terminal outcome without an active animation. Confirm failure details
+   identify the interrupted operation, repeat, target flow, and last position.
+5. Disconnect the browser's network briefly to verify the stale-data notice and
+   automatic reconnection; this does not itself stop the instrument.
+
+Automated tests use test-only hardware. Browser checks with synthetic API responses
+validate presentation, not piston motion, motor shutdown latency, physical ADC
+performance, wiring, or calibration accuracy. Those require the actual instrument.

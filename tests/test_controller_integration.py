@@ -176,6 +176,11 @@ def test_full_default_calibration_runs_real_controller_state_machine(tmp_path):
     controller.start("AIR", DEFAULT_TARGETS, 3)
     status = wait_terminal(controller)
     assert status["state"] == "COMPLETE", status
+    assert status["progress"] == 1
+    assert status["completed"] == 21 and status["remaining"] == 0
+    assert status["zero_before_completed"] and status["zero_after_completed"]
+    assert status["analysis_completed"]
+    assert status["last_completed_trial"]["repeat"] == 3
     analysis = controller.store.read_json(status["run_id"], "analysis.json")
     assert analysis["status"] in {"GOOD", "WARNING"}
     assert analysis["total_trials"] == analysis["accepted_trials"] == 21

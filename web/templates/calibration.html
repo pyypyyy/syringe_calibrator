@@ -1,1 +1,56 @@
-{% extends 'base.html' %}{% block content %}<h1>Calibration progress</h1><progress id="progress" max="1"></progress><dl id="status"></dl><button id="stop">Stop calibration</button><button id="emergency" class="danger">Emergency stop</button>{% endblock %}{% block scripts %}<script src="{{url_for('static',filename='calibration.js')}}"></script>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="calibration-page">
+  <h1>Calibration progress</h1>
+  <p id="connection" role="status">Connecting to instrument…</p>
+  <section aria-labelledby="overall-title">
+    <h2 id="overall-title">Overall calibration</h2>
+    <p id="overall-summary">Waiting for status</p>
+    <progress id="progress" max="1" value="0" aria-labelledby="overall-title"></progress>
+    <p class="muted">Milestones: initial zero, each measured and returned trial, final zero, completed analysis.</p>
+    <p id="trial-context">—</p>
+  </section>
+  <section id="operation-panel" aria-labelledby="operation-title">
+    <h2 id="operation-title">Current operation</h2>
+    <p id="operation-description" class="operation-description" aria-live="polite">Waiting for instrument</p>
+    <p id="operation-phase"></p>
+    <label for="operation-progress">Current operation progress <span id="operation-percent">—</span></label>
+    <progress id="operation-progress" max="1" value="0"></progress>
+    <ol class="workflow" aria-label="Trial workflow">
+      <li data-stage="POSITIONING">Positioning</li><li data-stage="SETTLING">Settling</li>
+      <li data-stage="MEASURING">Measuring</li><li data-stage="RETURNING">Returning</li>
+    </ol>
+    <dl class="live-values">
+      <dt>Measured piston position</dt><dd id="position">—</dd>
+      <dt>Measured Omron voltage (latest)</dt><dd id="voltage">—</dd>
+      <dt>Requested flow</dt><dd id="flow">—</dd>
+      <dt>Operation starting position</dt><dd id="start-position">—</dd>
+      <dt>Commanded target position</dt><dd id="target-position">—</dd>
+      <dt>Commanded direction</dt><dd id="direction">—</dd>
+      <dt>Operation elapsed</dt><dd id="elapsed">—</dd>
+      <dt>Settling / zero time remaining</dt><dd id="remaining-time">—</dd>
+    </dl>
+    <p id="message" role="status"></p>
+    <p id="failure-context"></p>
+    <a id="results-link" hidden>View calibration results</a>
+  </section>
+  <div class="stop-actions">
+    <button id="stop" type="button">Stop calibration</button>
+    <button id="emergency" class="danger" type="button">Emergency stop</button>
+  </div>
+  <section aria-labelledby="last-title">
+    <h2 id="last-title">Last completed trial</h2>
+    <p class="muted">Previous measurement and return completed. Acceptance can change after repeat quality checks.</p>
+    <p id="last-empty">No trial has completed its return yet.</p>
+    <dl id="last-trial" class="live-values" hidden>
+      <dt>Target flow / repeat</dt><dd id="last-target">—</dd>
+      <dt>Estimated reference flow</dt><dd id="last-reference">—</dd>
+      <dt>Average Omron voltage</dt><dd id="last-voltage">—</dd>
+      <dt>Measured stroke</dt><dd id="last-stroke">—</dd>
+      <dt>Trial quality</dt><dd id="last-quality">—</dd>
+      <dt>Rejection reason</dt><dd id="last-reason">—</dd>
+    </dl>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{url_for('static',filename='calibration.js')}}"></script>{% endblock %}
