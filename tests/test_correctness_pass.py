@@ -5,7 +5,7 @@ import yaml
 
 from analysis.quality import target_quality
 from calibration.calibration_plan import select_stroke
-from calibration.controller import CalibrationController
+from calibration.controller import CalibrationController, MotionSafetyError
 from hardware.softpot import SoftPotMapping
 from storage.runs import RunStore
 
@@ -29,8 +29,17 @@ def controller(tmp_path, low=0, high=100):
 def test_plans_respect_calibrated_softpot_range(tmp_path,low,high):
     c=controller(tmp_path,low,high)
     for target in c.config['calibration']['target_flows_lpm']:
-        plan=c.create_trial_plan(target)
-        assert low <= plan.end_volume_ml < plan.start_volume_ml <= high
+        candidate=select_stroke(target,c.config['calibration'],
+                                minimum_volume_ml=low,maximum_volume_ml=high)
+        preload=candidate.start_volume_ml + c.config['calibration']['directional_preload_ml']
+        clearance=c.config['calibration']['preload_clearance_ml']
+        tolerance=c.config['calibration']['position_tolerance_ml']
+        if preload + tolerance > high - clearance or candidate.end_volume_ml - tolerance < low + clearance:
+            with pytest.raises(MotionSafetyError, match='Insufficient room'):
+                c.create_trial_plan(target)
+        else:
+            plan=c.create_trial_plan(target)
+            assert low <= plan.end_volume_ml < plan.start_volume_ml < preload <= high - clearance
 
 def test_hot_loaded_reader_changes_planner_and_nonoverlap_fails(tmp_path):
     c=controller(tmp_path)

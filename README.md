@@ -39,7 +39,7 @@ Open `http://<raspberry-pi-address>:5000/` from a device on the same network. Th
 ## Workflow
 
 1. **SoftPot calibration:** open **SoftPot**, position the syringe at 100, 75, 50, 25, and 0 ml, capture each voltage distribution, then validate/save. Saving rejects non-monotonic, collapsed, duplicate, or excessively noisy point sets and activates a valid mapping in the running controller. Conversion is piecewise-linear and refuses readings outside its calibrated voltage range.
-2. **Flow calibration:** select AIR or CO2, targets, and repeats on the dashboard. Zero voltage is captured and stability-checked before and after. Each planned stroke contains safe start and end positions. Every repeat uses chunked, closed-loop SoftPot positioning, settles, measures toward its end position, and returns to the defined start; accumulated step counts are never treated as position truth.
+2. **Flow calibration:** select AIR or CO2, targets, and repeats on the dashboard. Zero voltage is captured and stability-checked before and after. Each planned stroke contains safe start and end positions. Every repeat uses chunked, closed-loop SoftPot preloading, approaches its start in the measurement direction, settles, measures toward its end position, and returns to the next preload point; accumulated step counts are never treated as position truth.
 3. **Progress and safety:** progress exposes `POSITIONING`, `SETTLING`, `MEASURING`, and `RETURNING` as real hardware states. Position range, persistent wrong direction, and lack of meaningful motion are watched during every move. Stop produces an inspectable `ABORTED` run; Emergency Stop first cancels pulses and disables the driver. Safety failures produce `FAILED` and cannot enter normal model fitting.
 4. **Measurement integrity:** complete motion samples remain in each raw CSV with `motion_phase` and `analysis_sample` fields. The initial and final transient fractions are excluded from both voltage statistics and the signed position-versus-time OLS regression. Trial QC precedes median/MAD repeat rejection; targets with fewer than two accepted repeats are excluded from fitting.
 5. **Results:** artifacts are persisted before `COMPLETE` becomes observable. The result includes explicit status reasons, equation and ranges, target-level points, accepted/rejected repeats, bootstrap band, CV and Omron errors, repeatability, an error table, structured diagnostics, and exports. History combines run metadata with completed analysis while tolerating failed or incomplete runs.
@@ -147,7 +147,7 @@ The existing status fields remain available. Additive `/api/status` fields:
 | `operation_start_position_ml` | Measured starting position used for motion progress |
 | `operation_target_position_ml` | Commanded piston destination, never a measured displacement |
 | `operation_direction` | Increasing/decreasing volume, stationary, or null |
-| `operation_phase` | `settling` or `recording` for zero capture; otherwise null |
+| `operation_phase` | `settling` or `recording` for zero capture; `planning`, `pre_positioning`, or `directional_approach` for positioning; otherwise null |
 | `failure_operation` | Operation interrupted by stop or failure; null when none |
 | `last_completed_trial` | Snapshot of the latest trial that also returned successfully, including existing QC results |
 
@@ -185,3 +185,114 @@ To verify on the Raspberry Pi under the normal commissioning precautions:
 Automated tests use test-only hardware. Browser checks with synthetic API responses
 validate presentation, not piston motion, motor shutdown latency, physical ADC
 performance, wiring, or calibration accuracy. Those require the actual instrument.
+
+## Directional preload before every measurement
+
+Each trial now first moves to a preload point, then approaches its measurement
+start **only in the measurement direction**. For a 0.05 L/min stroke, the nominal
+sequence is 71.750 ml → 68.750 ml → settle/verify → measure toward 31.250 ml.
+This applies to the first repeat, every subsequent repeat, and changes of flow
+level. A return goes directly to the next trial's preload point (or the current
+one after the final trial); it remains part of the preceding trial's operational
+completion milestone. No preload motion counts as a completed trial or enters
+the recorded flow/position regression samples.
+
+New `calibration` settings, also used as defaults for older configuration files:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `directional_preload_ml` | 3.0 | Distance opposite the measurement direction from its planned start. Provisional; must be validated experimentally. Must exceed twice `position_tolerance_ml`. |
+| `directional_preload_attempts` | 2 | Total approach attempts including the first; integer 1–3. |
+| `preload_clearance_ml` | 2.0 | Minimum clearance inside the intersection of mechanical and calibrated SoftPot limits. Positive and fixed, never silently reduced to fit a stroke. |
+
+The original stroke is rejected if its endpoints or preload cannot fit with
+clearance **and the existing position tolerance**. The planner does not silently
+shorten the stroke or change its target duration to create space. Consequently,
+a limited SoftPot calibration range may now reject a previously feasible stroke.
+Neither `microsteps_per_ml: 208.0` nor endpoint tolerances have been increased.
+
+The final approach uses only commands with the measurement's direction. It aims
+inside a quarter of the existing acceptance tolerance to reserve room for sensor
+noise. A crossing within the unchanged full tolerance is accepted without a
+reverse correction. An out-of-tolerance overshoot disables the driver, returns
+to preload, and retries within the configured attempt cap. Other feedback faults,
+settling drift beyond tolerance, and cancellation fail immediately. Both the
+settled target error and displacement since the approach must pass the existing
+position tolerance. There is no correction after settling before measurement.
+
+Each positioning leg has a commanded-step cap equal to the ceiling of
+`(initial distance to target + 2 × chunk size + 2 × position tolerance) × microsteps/ml`.
+Preparing a trial also shares an aggregate cap across every preload/recovery leg:
+`(initial distance to preload + (2A − 1) × preload distance + 2A × (chunk size + position tolerance)) × microsteps/ml`,
+rounded up to whole steps, with A the maximum number of attempts. These bounds
+count the sum of absolute commanded steps, not just net displacement. Chunks
+remain limited by the configured chunk size and pigpio's existing per-command
+limit. Existing direction and stall watchdogs remain active; cancellation is
+checked before each chunk. The driver is disabled on success or any error. These
+caps are software command limits, not independent measurements of physical travel.
+
+Stage 1 status now identifies initial `operation_phase: planning` validation, then distinguishes
+`pre_positioning` from
+`directional_approach` within POSITIONING. Added fields are
+`preload_position_ml`, `measurement_start_position_ml`, `positioning_attempt`, and
+`positioning_attempts_total`. Each phase resets its operation bar and timer, while
+overall progress retains the same N + 3 milestones. The browser keeps its 500 ms
+status polling and adds no ADC reads.
+
+Per-trial diagnostics are saved at
+`data/runs/<run_id>/trials/flow_<target>_repeat_<n>_positioning.json`, including
+failed or cancelled preparation when storage remains writable. Geometry rejection
+before movement also writes a smaller `phase: planning` failure record. The record includes
+configured distance, requested and reached preload, pre/post-settling positions,
+settling displacement, approach attempts, warnings/errors, last measured position,
+and aggregate commanded-step limits/usage. Successful trial summaries also contain
+an additive `positioning` object with these fields. Successful records are written
+only after measurement, so file I/O does not delay the transition from a freshly
+verified settled position to the measurement stroke. Failed measurements retain
+these preparation records with an additional `trial_error`; failed preparation
+records are saved with the driver disabled. Existing raw CSV columns,
+reference flow regression, 10% transient exclusions, QC, repeat rejection, model
+selection, and bootstrap calculations are unchanged. The records do not diagnose
+whether an endpoint error comes from contact hysteresis, mechanical scaling, or
+SoftPot calibration, and preloading is not a demonstrated fix for the observed
+0.75–1.0 ml endpoint errors.
+
+### Raspberry Pi update and supervised commissioning
+
+1. Stop the application through its normal supervisor and verify that motion has
+   stopped and the driver is disabled. **Disconnect motor power first.** Preserve
+   `data/`, the current SoftPot calibration, and any local configuration changes
+   before updating the checkout. Do not run two application/motor-control processes.
+2. Run `git fetch origin`, then check out `feat/directional-preloading` for PR
+   review, or use `git switch main` and `git pull --ff-only origin main` after merge. Reuse the existing virtual environment and dependencies; no new
+   packages are required. Compare the new settings with the instrument's existing
+   `config.yaml`; retain 208.0 microsteps/ml, GPIO assignments, and TB6600 DIP settings.
+3. This Pi requires pigpio's PCM clock: run the **single** daemon with
+   `pigpiod -t 0`. If systemd manages it, ensure its existing startup command includes
+   `-t 0`; do not launch a second daemon. Check the running daemon's command line
+   before starting `python app.py` from the activated virtual environment.
+4. With motor power still disconnected, verify UI readiness, real ADC readings,
+   mapping coverage, preload targets, and the physical travel available for every
+   intended stroke. Confirm independent hardware end-stop/travel protection and an
+   effective hardware emergency power cutoff before reconnecting motor power.
+5. Reconnect motor power only for attended commissioning with conservative speeds
+   and adequate clearance. Check direction and stopping. On separate short,
+   supervised runs, check Stop and Emergency Stop during pre-positioning and during
+   directional approach. Verify the driver is disabled after both cancellation and
+   any positioning failure.
+6. Observe at least two repeats at the same flow and a transition to another flow:
+   preload → decreasing-volume approach → settle → decreasing-volume measurement.
+   Inspect positioning JSON records for attempt count and drift. Verify no final
+   reverse correction and no trial count increase until the return finishes.
+7. Evaluate the provisional 3.0 ml preload on the real mechanism. Investigate any
+   remaining endpoint error independently; do not increase endpoint tolerances or
+   auto-adjust microsteps/ml to conceal it. A single-target commissioning run can
+   test sequence but cannot produce a valid calibration model.
+
+SoftPot-derived software limits share the same contact hysteresis and calibration
+errors they monitor. Commanded-step caps cannot protect independently against
+feedback errors, a host interruption, or a driver fault. A pigpio daemon can
+outlive the application. Independent hardware travel limits and a hardware power
+cutoff remain necessary; this software is **not safe for unattended operation**.
+Simulated tests do not establish physical safety, stopping distance, contact
+preload adequacy, waveform timing on the Pi, or calibration accuracy.

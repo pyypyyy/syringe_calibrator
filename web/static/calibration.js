@@ -35,9 +35,13 @@ function render(s) {
   text('trial-context', `Target ${s.target_index || '—'} of ${s.target_count || '—'} · Requested ${number(s.current_target_lpm, 'L/min')} · Repeat ${s.repeat || '—'} of ${s.repeats_total || '—'}`);
   text('operation-description', stopping ? 'Stop requested — stopping motor and terminating calibration.' :
     s.operation_description || (s.state === 'HARDWARE_ERROR' ? 'Hardware is not ready' : stageNames[s.state] || s.state));
-  text('operation-phase', s.operation_phase === 'settling' ? 'Zero measurement: waiting for the stopped system to settle.' :
+  text('operation-phase', s.operation_phase === 'planning' ? 'Checking all planned strokes before issuing motor commands.' :
+    s.operation_phase === 'pre_positioning' ? 'Pre-positioning only — no trial data is being recorded.' :
+    s.operation_phase === 'directional_approach' ? 'Approaching in the measurement direction — no trial data is being recorded.' :
+    s.operation_phase === 'settling' ? 'Zero measurement: waiting for the stopped system to settle.' :
     s.operation_phase === 'recording' && active ? 'Recording zero-flow sensor voltage.' :
     s.state === 'MEASURING' && active ? 'Sensor measurements are actively being recorded.' : '');
+  if (!active && s.operation_phase) text('operation-phase', `Last phase: ${s.operation_phase.replaceAll('_', ' ')}`);
   bar('operation-progress', s.operation_progress, active);
   text('operation-percent', typeof s.operation_progress === 'number' ? number(s.operation_progress * 100, '%', 1) : active ? 'In progress' : '—');
   byId('operation-panel').className = terminal ? `outcome-${s.state.toLowerCase()}` : '';
@@ -53,6 +57,9 @@ function render(s) {
   text('flow', number(s.current_target_lpm, 'L/min'));
   text('start-position', number(s.operation_start_position_ml, 'ml'));
   text('target-position', number(s.operation_target_position_ml, 'ml'));
+  text('preload-position', number(s.preload_position_ml, 'ml'));
+  text('measurement-start-position', number(s.measurement_start_position_ml, 'ml'));
+  text('positioning-attempt', s.positioning_attempt ? `${s.positioning_attempt} of ${s.positioning_attempts_total || '—'}` : '—');
   text('direction', s.operation_direction || '—');
   text('elapsed', number(s.operation_elapsed_s, 's', 1));
   text('remaining-time', active ? number(s.operation_remaining_s, 's', 1) : '—');

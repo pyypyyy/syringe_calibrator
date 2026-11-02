@@ -179,7 +179,7 @@ def test_measurement_commands_measured_start_to_planned_endpoint(tmp_path):
     plant, reader, controller = setup(tmp_path)
     plan = controller.create_trial_plan(1)
     plant.position = 79.55
-    controller.move_to_volume = lambda *args:79.55
+    controller.prepare_trial = lambda *args:(79.55, {})
     controller.config['calibration']['settle_s'] = 0
     def watch(measured_plan, started):
         assert measured_plan.start_volume_ml == 79.55
