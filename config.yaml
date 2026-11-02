@@ -5,6 +5,10 @@ axis: {syringe_volume_ml: 100.0, microsteps_per_ml: 208.0}
 calibration:
   target_flows_lpm: [0.02, 0.05, 0.10, 0.25, 0.50, 0.75, 1.00]
   repeats: 3
+  # Provisional: validate contact preload experimentally on the instrument.
+  directional_preload_ml: 3.0
+  directional_preload_attempts: 2
+  preload_clearance_ml: 2.0
   positioning_speed_lpm: 0.1
   positioning_chunk_ml: 0.5
   position_tolerance_ml: 0.5

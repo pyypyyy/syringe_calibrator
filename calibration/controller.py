@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
@@ -19,7 +20,7 @@ from analysis.quality import (
 from analysis.reference_flow import estimate_reference_flow
 from analysis.uncertainty import bootstrap_band
 from analysis.omron_reference import omron_reference
-from .calibration_plan import StrokePlan, select_stroke
+from .calibration_plan import StrokePlan, select_stroke, directional_preload_position
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,21 @@ class MotionSafetyError(RuntimeError):
     """Raised when position feedback makes continued motion unsafe."""
 
 
+class DirectionalApproachOvershoot(MotionSafetyError):
+    """A bounded retry from preload may recover; never correct in reverse."""
+
+
+@dataclass
+class PositioningBudget:
+    limit_steps: int
+    used_steps: int = 0
+
+    def reserve(self, steps):
+        if self.used_steps + abs(steps) > self.limit_steps:
+            raise MotionSafetyError("Positioning pulse/travel budget exhausted (possible stall or inconsistent feedback)")
+        self.used_steps += abs(steps)
+
+
 @dataclass
 class Status:
     state: State = State.IDLE
@@ -65,6 +81,10 @@ class Status:
     zero_before_completed: bool = False
     zero_after_completed: bool = False
     analysis_completed: bool = False
+    preload_position_ml: float | None = None
+    measurement_start_position_ml: float | None = None
+    positioning_attempt: int = 0
+    positioning_attempts_total: int = 0
     operation_start_position_ml: float | None = None
     operation_target_position_ml: float | None = None
     operation_duration_s: float | None = None
@@ -153,6 +173,14 @@ class CalibrationController:
                 State.FAILED: "Calibration failed",
                 State.HARDWARE_ERROR: "Hardware is not ready",
             }
+            if state == State.POSITIONING:
+                descriptions[state] = {
+                    "planning": "Validating directional preload and stroke limits",
+                    "pre_positioning": "Pre-positioning: moving piston to preload position",
+                    "directional_approach": "Directional approach: moving to measurement start",
+                }.get(current.operation_phase, descriptions[state])
+            if state == State.RETURNING:
+                descriptions[state] = "Returning piston to preload position"
             status["operation_description"] = descriptions[state]
             return status
 
@@ -284,12 +312,21 @@ class CalibrationController:
 
     def create_trial_plan(self, target_flow_lpm: float) -> StrokePlan:
         low, high = self._position_bounds()
-        return select_stroke(
+        plan = select_stroke(
             target_flow_lpm,
             self.config.get("calibration", {}),
             minimum_volume_ml=low,
             maximum_volume_ml=high,
         )
+        self.preload_position(plan)
+        return plan
+
+    def preload_position(self, plan):
+        low, high = self._position_bounds()
+        try:
+            return directional_preload_position(plan, self.config.get("calibration", {}), low, high)
+        except ValueError as exc:
+            raise MotionSafetyError(str(exc)) from exc
 
     def _validate_target(self, target_ml: float):
         low, high = self._position_bounds()
@@ -298,58 +335,216 @@ class CalibrationController:
                 f"Commanded position {target_ml:.3f} ml is outside safe calibrated range {low:g}–{high:g} ml."
             )
 
-    def move_to_volume(self, target_ml: float, state: State = State.POSITIONING) -> float:
-        """Move in feedback-controlled chunks with direction and stall watchdogs."""
-        self._validate_target(target_ml)
-        self._set(state=state, operation_target_position_ml=target_ml)
-        calibration = self.config.get("calibration", {})
-        safety = self.config.get("safety", {})
-        # Reserve half the acceptance tolerance for stationary sensor noise and
-        # the subsequent start/endpoint verification; do not stop on its edge.
-        tolerance = float(calibration.get("position_tolerance_ml", 0.5)) / 2
-        chunk_ml = float(calibration.get("positioning_chunk_ml", 0.5))
-        speed = float(calibration.get("positioning_speed_lpm", 0.1))
-        microsteps = float(self.config.get("axis", {}).get("microsteps_per_ml", 208))
-        frequency = speed * 1000 / 60 * microsteps
-        minimum_change = float(safety.get("minimum_position_change_ml", 0.1))
-        stall_timeout = float(safety.get("stall_timeout_s", 2.0))
-        wrong_tolerance = float(safety.get("wrong_direction_tolerance_ml", 0.5))
-        _, current = self._safe_position(fresh=True)
-        self._set(operation_start_position_ml=current, operation_target_position_ml=target_ml)
-        expected_sign = 1 if target_ml > current else -1
-        progress_position, progress_time = current, time.monotonic()
-        opposite_total = 0.0
-        while abs(target_ml - current) > tolerance:
+    def move_to_volume(self, target_ml: float, state: State = State.POSITIONING,
+                       *, approach_direction=None, budget=None) -> float:
+        """Feedback chunks with finite pulse/travel bounds and existing watchdogs.
+
+        approach_direction fixes the command sign. Crossing the target within the
+        existing tolerance is accepted without reversal; crossing beyond it raises
+        a retryable error. General pre-position/return moves may still correct.
+        """
+        try:
             self._check_stopped()
-            expected_sign = 1 if target_ml > current else -1
-            amount = min(chunk_ml, abs(target_ml - current))
-            steps = round(expected_sign * amount * microsteps)
-            before = current
-            self.stepper.move(steps, frequency, self._stop)
-            self._check_stopped()
+            self._validate_target(target_ml)
+            self._set(state=state, operation_target_position_ml=target_ml)
+            calibration = self.config.get("calibration", {})
+            safety = self.config.get("safety", {})
+            allowed_error = float(calibration.get("position_tolerance_ml", 0.5))
+            tolerance = allowed_error / 2
+            chunk_ml = float(calibration.get("positioning_chunk_ml", 0.5))
+            speed = float(calibration.get("positioning_speed_lpm", 0.1))
+            microsteps = float(self.config.get("axis", {}).get("microsteps_per_ml", 208))
+            if (not all(math.isfinite(v) and v > 0 for v in (allowed_error, chunk_ml, speed, microsteps))
+                    or approach_direction not in (None, -1, 1)):
+                raise MotionSafetyError("Invalid bounded positioning configuration")
+            frequency = speed * 1000 / 60 * microsteps
+            minimum_change = float(safety.get("minimum_position_change_ml", 0.1))
+            stall_timeout = float(safety.get("stall_timeout_s", 2.0))
+            wrong_tolerance = float(safety.get("wrong_direction_tolerance_ml", 0.5))
             _, current = self._safe_position(fresh=True)
-            delta = current - before
-            if delta * expected_sign < 0:
-                opposite_total += abs(delta)
-            else:
-                opposite_total = max(0.0, opposite_total - abs(delta))
-            if opposite_total > wrong_tolerance:
-                self.stepper.disable()
-                direction = "increasing" if expected_sign > 0 else "decreasing"
+            self._set(operation_start_position_ml=current, operation_target_position_ml=target_ml)
+            local_budget = PositioningBudget(math.ceil(
+                (abs(target_ml - current) + 2 * chunk_ml + 2 * allowed_error) * microsteps))
+            progress_position, progress_time = current, time.monotonic()
+            opposite_total = 0.0
+            while True:
+                self._check_stopped()
+                if approach_direction is not None:
+                    remaining = (target_ml - current) * approach_direction
+                    if remaining < -allowed_error:
+                        raise DirectionalApproachOvershoot(
+                            f"Directional approach overshot start {target_ml:.3f} ml: "
+                            f"measured {current:.3f} ml; tolerance {allowed_error:g} ml"
+                        )
+                    # Aim inside a quarter of the unchanged acceptance tolerance,
+                    # leaving more headroom for stationary noise without reversal.
+                    if remaining <= allowed_error / 4:
+                        if not local_budget.used_steps:
+                            raise MotionSafetyError("Directional approach ended without a movement command")
+                        return current
+                    expected_sign = approach_direction
+                else:
+                    if abs(target_ml - current) <= tolerance:
+                        return current
+                    expected_sign = 1 if target_ml > current else -1
+                amount = min(chunk_ml, abs(target_ml - current), 65535 / microsteps)
+                steps = round(expected_sign * amount * microsteps)
+                if not steps:
+                    raise MotionSafetyError("Positioning cannot resolve target within tolerance")
+                local_budget.reserve(steps)
+                if budget is not None:
+                    budget.reserve(steps)
+                # Check after bookkeeping too: never issue another chunk after cancellation.
+                self._check_stopped()
+                before = current
+                self.stepper.move(steps, frequency, self._stop)
+                self._check_stopped()
+                _, current = self._safe_position(fresh=True)
+                delta = current - before
+                if delta * expected_sign < 0:
+                    opposite_total += abs(delta)
+                else:
+                    opposite_total = max(0.0, opposite_total - abs(delta))
+                if opposite_total > wrong_tolerance:
+                    direction = "increasing" if expected_sign > 0 else "decreasing"
+                    raise MotionSafetyError(
+                        "SoftPot position moved persistently in the opposite direction. "
+                        f"Expected {direction} volume; observed {current - progress_position:+.3f} ml."
+                    )
+                if abs(current - progress_position) >= minimum_change:
+                    progress_position, progress_time = current, time.monotonic()
+                elif time.monotonic() - progress_time >= stall_timeout:
+                    raise MotionSafetyError(
+                        f"Motion stall detected: SoftPot position changed less than {minimum_change:g} ml "
+                        f"in {stall_timeout:g} seconds."
+                    )
+        finally:
+            self.stepper.disable()
+
+    def _positioning_phase(self, phase, attempt, attempts, preload, start):
+        self._set(state=State.POSITIONING, operation_phase=phase,
+                  preload_position_ml=preload, measurement_start_position_ml=start,
+                  positioning_attempt=attempt, positioning_attempts_total=attempts)
+        with self._lock:
+            if self._status.state != State.STOPPING:
+                self._operation_started = time.monotonic()
+                self._operation_progress = None
+                self._status.operation_start_position_ml = None
+                self._status.operation_target_position_ml = None
+
+    def prepare_trial(self, plan, target, repeat):
+        """Preload, approach in one direction, settle, then verify fresh feedback.
+
+        Only an out-of-tolerance overshoot is retried. Other feedback faults and
+        cancellation fail immediately. No flow samples are collected here.
+        """
+        cfg = self.config.get("calibration", {})
+        diagnostics = {
+            "target_flow_lpm": target, "repeat": repeat,
+            "configured_preload_ml": cfg.get("directional_preload_ml", 3.0),
+            "measurement_start_ml": plan.start_volume_ml,
+            "preload_target_ml": None, "preload_reached_ml": None,
+            "start_after_approach_ml": None, "start_after_settling_ml": None,
+            "settling_displacement_ml": None, "attempts": [], "warnings": [],
+            "status": "POSITIONING", "phase": "pre_positioning",
+        }
+        budget = None
+        try:
+            self._check_stopped()
+            self._set(state=State.POSITIONING, operation_phase="pre_positioning",
+                      measurement_start_position_ml=plan.start_volume_ml)
+            preload = self.preload_position(plan)
+            diagnostics["preload_target_ml"] = preload
+            attempts = cfg.get("directional_preload_attempts", 2)
+            tolerance = float(cfg.get("position_tolerance_ml", 0.5))
+            chunk = float(cfg.get("positioning_chunk_ml", 0.5))
+            microsteps = float(self.config.get("axis", {}).get("microsteps_per_ml", 208))
+            if not all(math.isfinite(v) and v > 0 for v in (chunk, microsteps)):
+                raise MotionSafetyError("Invalid bounded positioning configuration")
+            self._positioning_phase("pre_positioning", 1, attempts, preload, plan.start_volume_ml)
+            _, initial = self._safe_position(fresh=True)
+            distance = float(diagnostics["configured_preload_ml"])
+            # Shared cap covers initial transit and every permitted recovery leg.
+            travel_limit = (abs(preload - initial) + (2 * attempts - 1) * distance
+                            + 2 * attempts * (chunk + tolerance))
+            budget = PositioningBudget(math.ceil(travel_limit * microsteps))
+            diagnostics["pulse_limit"] = budget.limit_steps
+            diagnostics["travel_limit_ml"] = budget.limit_steps / microsteps
+            for attempt in range(1, attempts + 1):
+                self._check_stopped()
+                diagnostics["phase"] = "pre_positioning"
+                self._positioning_phase("pre_positioning", attempt, attempts, preload, plan.start_volume_ml)
+                reached_preload = self.move_to_volume(preload, budget=budget)
+                diagnostics["preload_reached_ml"] = reached_preload
+                entry = {"attempt": attempt, "preload_reached_ml": reached_preload}
+                diagnostics["attempts"].append(entry)
+                if (plan.start_volume_ml - reached_preload) * plan.direction <= tolerance:
+                    raise MotionSafetyError("Preload did not leave room for a directional approach")
+                diagnostics["phase"] = "directional_approach"
+                self._positioning_phase("directional_approach", attempt, attempts, preload, plan.start_volume_ml)
+                try:
+                    reached = self.move_to_volume(plan.start_volume_ml,
+                        approach_direction=plan.direction, budget=budget)
+                except DirectionalApproachOvershoot as exc:
+                    entry["error"] = str(exc)
+                    diagnostics["warnings"].append(str(exc))
+                    if attempt == attempts:
+                        raise MotionSafetyError(f"Directional approach failed after {attempts} attempts: {exc}") from exc
+                    continue
+                entry["start_after_approach_ml"] = reached
+                diagnostics["start_after_approach_ml"] = reached
+                if abs(reached - plan.start_volume_ml) > tolerance:
+                    raise MotionSafetyError("measurement start position was not reached within tolerance")
+                if (reached - plan.start_volume_ml) * plan.direction > 0:
+                    diagnostics["warnings"].append("Approach crossed target within tolerance; no reverse correction")
+                break
+            diagnostics["phase"] = "settling"
+            self._set(state=State.SETTLING,
+                      operation_duration_s=float(cfg.get("settle_s", 2.0)))
+            if self._stop.wait(float(cfg.get("settle_s", 2.0))):
+                self._check_stopped()
+            self._check_stopped()
+            _, settled = self._safe_position(fresh=True)
+            diagnostics["start_after_settling_ml"] = settled
+            diagnostics["settling_displacement_ml"] = settled - reached
+            if (abs(settled - plan.start_volume_ml) > tolerance
+                    or abs(settled - reached) > tolerance):
                 raise MotionSafetyError(
-                    "SoftPot position moved persistently in the opposite direction. "
-                    f"Expected {direction} volume; observed {current - progress_position:+.3f} ml."
+                    "measurement start position changed during settling: "
+                    f"approach {reached:.3f}, settled {settled:.3f}, target {plan.start_volume_ml:.3f} ml"
                 )
-            if abs(current - progress_position) >= minimum_change:
-                progress_position, progress_time = current, time.monotonic()
-            elif time.monotonic() - progress_time >= stall_timeout:
-                self.stepper.disable()
-                raise MotionSafetyError(
-                    f"Motion stall detected: SoftPot position changed less than {minimum_change:g} ml "
-                    f"in {stall_timeout:g} seconds."
+            if abs(settled - reached) > tolerance / 2:
+                diagnostics["warnings"].append(
+                    f"Position shifted {settled - reached:+.3f} ml during settling (within tolerance)"
                 )
-        self.stepper.disable()
-        return current
+            self._check_stopped()
+            diagnostics["status"] = "READY"
+            return settled, diagnostics
+        except Exception as exc:
+            diagnostics["status"] = "ABORTED" if isinstance(exc, InterruptedError) else "FAILED"
+            diagnostics["error"] = str(exc)
+            self.stepper.disable()
+            raise
+        finally:
+            diagnostics["commanded_steps"] = budget.used_steps if budget else 0
+            diagnostics["approach_attempts"] = len(diagnostics["attempts"])
+            with self._lock:
+                run_id = self._status.run_id
+                diagnostics["last_measured_position_ml"] = self._status.position_ml
+            # Successful diagnostics are persisted after measurement, never in
+            # the gap between fresh settling verification and starting the stroke.
+            if run_id and "error" in diagnostics:
+                try:
+                    self._save_positioning_diagnostics(target, repeat, diagnostics)
+                except Exception:
+                    log.exception("could not persist failed positioning diagnostics")
+
+    def _save_positioning_diagnostics(self, target, repeat, diagnostics):
+        with self._lock:
+            run_id = self._status.run_id
+        if run_id:
+            self.store.write_json(run_id,
+                f"trials/flow_{target:.3f}_repeat_{repeat}_positioning.json", diagnostics)
 
     def capture_zero(self, state: State) -> dict:
         self._set(state=state)
@@ -456,52 +651,49 @@ class CalibrationController:
 
     def execute_trial(self, plan: StrokePlan, target: float, repeat: int, started_run: float) -> tuple[dict, list[dict]]:
         self._set(current_target_lpm=target, repeat=repeat)
-        self._validate_target(plan.start_volume_ml)
-        self._validate_target(plan.end_volume_ml)
-        reached = self.move_to_volume(plan.start_volume_ml, State.POSITIONING)
-        tolerance = float(self.config.get("calibration", {}).get("position_tolerance_ml", 0.5))
-        if abs(reached - plan.start_volume_ml) > tolerance:
-            raise MotionSafetyError("measurement start position was not reached within tolerance")
-        self._set(state=State.SETTLING,
-                  operation_duration_s=float(self.config.get("calibration", {}).get("settle_s", 2.0)))
-        if self._stop.wait(float(self.config.get("calibration", {}).get("settle_s", 2.0))):
+        reached, positioning = self.prepare_trial(plan, target, repeat)
+        try:
+            actual_stroke = (plan.end_volume_ml - reached) * plan.direction
+            if actual_stroke <= 0:
+                raise MotionSafetyError("measurement start is past the planned endpoint")
+            plan = replace(plan, start_volume_ml=reached, stroke_ml=actual_stroke,
+                           expected_duration_s=actual_stroke / (target * 1000 / 60))
+            self._set(state=State.MEASURING, operation_start_position_ml=plan.start_volume_ml,
+                      operation_target_position_ml=plan.end_volume_ml)
+            trial_started = time.monotonic()
+            samples = self._watch_measurement(plan, trial_started)
+            # A stop can terminate the motion thread between watcher iterations.
+            # Preserve cancellation semantics instead of misreporting short partial
+            # sampling as a hardware failure.
             self._check_stopped()
-        self._check_stopped()
-        # The disabled axis can drift during settling. Recheck fresh feedback
-        # before enabling pulses, then command from that measured start.
-        _, reached = self._safe_position(fresh=True)
-        if abs(reached - plan.start_volume_ml) > tolerance:
-            raise MotionSafetyError("measurement start position changed during settling")
-        actual_stroke = (plan.end_volume_ml - reached) * plan.direction
-        if actual_stroke <= 0:
-            raise MotionSafetyError("measurement start is past the planned endpoint")
-        plan = replace(plan, start_volume_ml=reached, stroke_ml=actual_stroke,
-                       expected_duration_s=actual_stroke / (target * 1000 / 60))
-        self._set(state=State.MEASURING, operation_start_position_ml=plan.start_volume_ml,
-                  operation_target_position_ml=plan.end_volume_ml)
-        trial_started = time.monotonic()
-        samples = self._watch_measurement(plan, trial_started)
-        # A stop can terminate the motion thread between watcher iterations.
-        # Preserve cancellation semantics instead of misreporting short partial
-        # sampling as a hardware failure.
-        self._check_stopped()
-        if len(samples) < 3:
-            raise MotionSafetyError("measurement produced fewer than three samples")
-        _, final_position = self._safe_position(fresh=True)
-        endpoint_tolerance = max(
-            float(self.config.get("calibration", {}).get("position_tolerance_ml", 0.5)),
-            float(self.config.get("calibration", {}).get("positioning_chunk_ml", 0.5)),
-        )
-        if abs(final_position - plan.end_volume_ml) > endpoint_tolerance:
-            raise MotionSafetyError(
-                f"measurement end position was not reached: expected {plan.end_volume_ml:.3f} ml, "
-                f"observed {final_position:.3f} ml"
+            if len(samples) < 3:
+                raise MotionSafetyError("measurement produced fewer than three samples")
+            _, final_position = self._safe_position(fresh=True)
+            endpoint_tolerance = max(
+                float(self.config.get("calibration", {}).get("position_tolerance_ml", 0.5)),
+                float(self.config.get("calibration", {}).get("positioning_chunk_ml", 0.5)),
             )
-        summary = self.analyze_trial(plan, target, repeat, samples)
-        # Authoritative stationary endpoint readings, not commanded displacement.
-        summary["measured_stroke_ml"] = abs(final_position - reached)
-        self._set(elapsed_s=time.monotonic() - started_run)
-        return summary, samples
+            if abs(final_position - plan.end_volume_ml) > endpoint_tolerance:
+                raise MotionSafetyError(
+                    f"measurement end position was not reached: expected {plan.end_volume_ml:.3f} ml, "
+                    f"observed {final_position:.3f} ml"
+                )
+            summary = self.analyze_trial(plan, target, repeat, samples)
+            # Authoritative stationary endpoint readings, not commanded displacement.
+            summary["measured_stroke_ml"] = abs(final_position - reached)
+            summary["positioning"] = positioning
+            self._set(elapsed_s=time.monotonic() - started_run)
+            return summary, samples
+        except Exception as exc:
+            positioning["trial_error"] = str(exc)
+            raise
+        finally:
+            try:
+                self._save_positioning_diagnostics(target, repeat, positioning)
+            except Exception:
+                if "trial_error" not in positioning:
+                    raise
+                log.exception("could not persist positioning diagnostics after trial failure")
 
     def analyze_trial(self, plan, target, repeat, samples):
         window = self.config.get("analysis_window", {})
@@ -732,16 +924,34 @@ class CalibrationController:
                 raise MotionSafetyError("Unstable zero-before: " + "; ".join(reasons))
             self._set(zero_before_completed=True)
             target_info = []
+            self._set(state=State.POSITIONING, operation_phase="planning")
+            plans = []
             for target_index, target in enumerate(targets, 1):
                 self._set(current_target_lpm=target, target_index=target_index, repeat=1)
-                plan = self.create_trial_plan(target)
+                try:
+                    plans.append(self.create_trial_plan(target))
+                except MotionSafetyError as exc:
+                    self.store.write_json(run_id,
+                        f"trials/flow_{target:.3f}_repeat_1_positioning.json", {
+                            "status": "FAILED", "phase": "planning", "error": str(exc),
+                            "target_flow_lpm": target, "repeat": 1,
+                            "configured_preload_ml": self.config.get("calibration", {}).get("directional_preload_ml", 3.0),
+                            "approach_attempts": 0, "commanded_steps": 0,
+                        })
+                    raise
+            for target_index, (target, plan) in enumerate(zip(targets, plans), 1):
+                self._set(current_target_lpm=target, target_index=target_index, repeat=1)
                 for repeat in range(1, repeats + 1):
                     self._check_stopped()
                     summary, samples = self.execute_trial(plan, target, repeat, started)
                     summaries.append(summary)
                     self.store.write_csv(run_id, f"trials/{summary['trial_id']}.csv", samples)
                     # Operational completion requires the return, even if trial QC rejected data.
-                    self.move_to_volume(plan.start_volume_ml, State.RETURNING)
+                    next_plan = plans[target_index] if repeat == repeats and target_index < len(plans) else plan
+                    preload = self.preload_position(next_plan)
+                    self._set(preload_position_ml=preload,
+                              measurement_start_position_ml=next_plan.start_volume_ml)
+                    self.move_to_volume(preload, State.RETURNING)
                     self._check_stopped()
                     self._set(
                         completed=len(summaries),

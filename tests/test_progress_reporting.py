@@ -94,7 +94,7 @@ def test_real_workflow_counts_only_after_return_and_retains_last_trial(tmp_path,
     controller, _, _ = make_controller(tmp_path)
     original_move = controller.move_to_volume
     snapshots = []
-    def move(target, state=State.POSITIONING):
+    def move(target, state=State.POSITIONING, **kwargs):
         if state == State.RETURNING:
             snapshots.append(controller.status())
             if return_failure:
@@ -103,7 +103,7 @@ def test_real_workflow_counts_only_after_return_and_retains_last_trial(tmp_path,
         elif snapshots:
             # Previous summary remains visible until the next return succeeds.
             assert controller.status()['last_completed_trial']['repeat'] == len(snapshots)
-        return original_move(target, state)
+        return original_move(target, state, **kwargs)
     controller.move_to_volume = move
     controller.start('AIR', [.1], 2)
     status = wait_terminal(controller)

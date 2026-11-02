@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -56,3 +57,36 @@ def select_stroke(
     start = center + stroke / 2.0
     end = center - stroke / 2.0
     return StrokePlan(target_flow_lpm, start, end, stroke, stroke / ml_s)
+
+
+def directional_preload_position(plan, settings, minimum_volume_ml, maximum_volume_ml):
+    """Validate the existing stroke without shrinking it to make preload fit.
+
+    Reserve a fixed clearance inside both mechanical and calibrated limits, plus
+    the existing start tolerance so an accepted endpoint cannot use that margin.
+    Legacy configurations receive the same provisional defaults as config.yaml.
+    """
+    distance = float(settings.get("directional_preload_ml", 3.0))
+    clearance = float(settings.get("preload_clearance_ml", 2.0))
+    tolerance = float(settings.get("position_tolerance_ml", 0.5))
+    attempts = settings.get("directional_preload_attempts", 2)
+    if (not all(math.isfinite(v) for v in (distance, clearance, tolerance))
+            or tolerance <= 0 or distance <= 2 * tolerance or clearance <= 0):
+        raise ValueError("Preload distance must exceed twice the position tolerance; clearance must be positive")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= 3:
+        raise ValueError("directional_preload_attempts must be an integer from 1 to 3")
+    if plan.direction not in (-1, 1):
+        raise ValueError("invalid measurement direction")
+    preload = plan.start_volume_ml - plan.direction * distance
+    low, high = minimum_volume_ml + clearance, maximum_volume_ml - clearance
+    if (not all(math.isfinite(v) for v in (preload, plan.start_volume_ml, plan.end_volume_ml,
+                                             minimum_volume_ml, maximum_volume_ml))
+            or low >= high
+            or min(preload, plan.start_volume_ml, plan.end_volume_ml) - tolerance < low
+            or max(preload, plan.start_volume_ml, plan.end_volume_ml) + tolerance > high):
+        raise ValueError(
+            f"Insufficient room for directional preload: stroke {plan.start_volume_ml:.3f} to "
+            f"{plan.end_volume_ml:.3f} ml, preload {preload:.3f} ml; "
+            f"clearance range {low:g}–{high:g} ml with {tolerance:g} ml tolerance"
+        )
+    return preload
